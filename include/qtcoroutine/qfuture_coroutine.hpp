@@ -8,7 +8,7 @@ namespace std {
 template<typename T, typename... Args>
 struct coroutine_traits<QFuture<T>, Args...> {
     struct promise_type {
-        QFuture<T> get_return_object() noexcept {
+        [[nodiscard]] QFuture<T> get_return_object() noexcept {
             return qpromise.future();
         }
 
@@ -26,6 +26,11 @@ struct coroutine_traits<QFuture<T>, Args...> {
             qpromise.finish();
         }
 
+        void return_value(T && value) noexcept {
+            qpromise.addResult(std::move(value));
+            qpromise.finish();
+        }
+
         void unhandled_exception() noexcept {
             qpromise.setException(std::current_exception());
             qpromise.finish();
@@ -39,7 +44,7 @@ struct coroutine_traits<QFuture<T>, Args...> {
 template<typename... Args>
 struct coroutine_traits<QFuture<void>, Args...> {
     struct promise_type {
-        QFuture<void> get_return_object() noexcept {
+        [[nodiscard]] QFuture<void> get_return_object() noexcept {
             return qpromise.future();
         }
 
@@ -68,7 +73,7 @@ struct coroutine_traits<QFuture<void>, Args...> {
 
 // operator co_await for QFuture awaitable
 template<typename T>
-auto operator co_await(QFuture<T> future) {
+[[nodiscard]] auto operator co_await(QFuture<T> future) {
     class Awaitable {
     public:
         Awaitable(QFuture<T> && future)
@@ -80,6 +85,10 @@ auto operator co_await(QFuture<T> future) {
         }
 
         void await_suspend(std::coroutine_handle<> handle) {
+            Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                        "co_await QFuture",
+                        "co_await requires a running event loop on this thread");
+
             // m_handle = handle;  // Reserved for future use (e.g. cancellation support)
 
             // Lambda will only execute if watcher still exists (thus tied to lifetime of Awaitable instance)
@@ -99,6 +108,7 @@ auto operator co_await(QFuture<T> future) {
             } catch (QUnhandledException & e) {
                 if (e.exception())
                     std::rethrow_exception(e.exception());
+                throw;
             }
 
             if constexpr (!std::is_void_v<T>) {
@@ -107,6 +117,8 @@ auto operator co_await(QFuture<T> future) {
                 else
                     throw std::runtime_error("Awaitable cannot await_resume invalid future");
             }
+            else
+                return;
         }
 
     private:
