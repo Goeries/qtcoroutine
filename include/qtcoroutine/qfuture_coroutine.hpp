@@ -85,6 +85,10 @@ template<typename T>
         }
 
         void await_suspend(std::coroutine_handle<> handle) {
+            Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                        "co_await QFuture",
+                        "co_await requires a running event loop on this thread");
+
             // m_handle = handle;  // Reserved for future use (e.g. cancellation support)
 
             // Lambda will only execute if watcher still exists (thus tied to lifetime of Awaitable instance)
