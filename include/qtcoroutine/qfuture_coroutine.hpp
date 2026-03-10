@@ -26,6 +26,11 @@ struct coroutine_traits<QFuture<T>, Args...> {
             qpromise.finish();
         }
 
+        void return_value(T && value) noexcept {
+            qpromise.addResult(std::move(value));
+            qpromise.finish();
+        }
+
         void unhandled_exception() noexcept {
             qpromise.setException(std::current_exception());
             qpromise.finish();
