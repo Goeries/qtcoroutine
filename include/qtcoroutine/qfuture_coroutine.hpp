@@ -104,6 +104,7 @@ auto operator co_await(QFuture<T> future) {
             } catch (QUnhandledException & e) {
                 if (e.exception())
                     std::rethrow_exception(e.exception());
+                throw;
             }
 
             if constexpr (!std::is_void_v<T>) {
@@ -112,6 +113,8 @@ auto operator co_await(QFuture<T> future) {
                 else
                     throw std::runtime_error("Awaitable cannot await_resume invalid future");
             }
+            else
+                return;
         }
 
     private:
