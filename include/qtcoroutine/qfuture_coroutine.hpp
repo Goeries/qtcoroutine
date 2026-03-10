@@ -8,7 +8,7 @@ namespace std {
 template<typename T, typename... Args>
 struct coroutine_traits<QFuture<T>, Args...> {
     struct promise_type {
-        QFuture<T> get_return_object() noexcept {
+        [[nodiscard]] QFuture<T> get_return_object() noexcept {
             return qpromise.future();
         }
 
@@ -44,7 +44,7 @@ struct coroutine_traits<QFuture<T>, Args...> {
 template<typename... Args>
 struct coroutine_traits<QFuture<void>, Args...> {
     struct promise_type {
-        QFuture<void> get_return_object() noexcept {
+        [[nodiscard]] QFuture<void> get_return_object() noexcept {
             return qpromise.future();
         }
 
@@ -73,7 +73,7 @@ struct coroutine_traits<QFuture<void>, Args...> {
 
 // operator co_await for QFuture awaitable
 template<typename T>
-auto operator co_await(QFuture<T> future) {
+[[nodiscard]] auto operator co_await(QFuture<T> future) {
     class Awaitable {
     public:
         Awaitable(QFuture<T> && future)
