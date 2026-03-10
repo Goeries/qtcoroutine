@@ -1,0 +1,13 @@
+stages:
+  - build
+
+build-and-test:
+  stage: build
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update -qq
+    - apt-get install -y -qq build-essential cmake qt6-base-dev libqt6concurrent6 libqt6test6
+  script:
+    - cmake -B build -DQTCOROUTINE_BUILD_TESTS=ON
+    - cmake --build build
+    - ctest --test-dir build --output-on-failure
