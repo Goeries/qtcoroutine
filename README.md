@@ -1,70 +1,141 @@
 # qtcoroutine
 
-qtcoroutine brings modern C++ coroutine facilities to Qt's event loop system as an immediate alternative to Qt's [signal/slot callback-](https://doc.qt.io/qt-6/signalsandslots.html) and [future-based asynchronous patterns](https://doc.qt.io/qt-6/qfuture.html).
-It's lightweight, uses [QPromise](https://doc.qt.io/qt-6/qpromise.html) under the hood, and is designed to be **header-only** for [easy integration with existing projects](#integration).
-
-Until the [Qt Framework](https://www.qt.io/development/qt-framework) supports [coroutines](https://en.cppreference.com/w/cpp/language/coroutines.html) natively, one (or both) of the following headers can easily be added to a project to integrate the use of coroutines with Qt's event loop:
-1. `qtcoroutine/qfuture_coroutine.hpp` — Makes `QFuture` **awaitable** (using `co_await`) and usable as a **coroutine return type** (using `co_return`)
-2. `qtcoroutine/qtcoroutine.hpp` — Provides a `QTask` alternative if you prefer not to change the behavior of `QFuture` 
-
-Coroutines hold several improvements over callback- and future-based async patterns, including intuitive control flow, natural exception propagation to callers, and a deep level of control for intricate async operations.
-
-## Usage Examples
-
-### `qtcoroutine/qfuture_coroutine.hpp`
-
-```cpp
-#include <qtcoroutine/qfuture_coroutine.hpp>
-
-QFuture<int> computeAsync() {
-    int result = co_await QtConcurrent::run([] { return 42; });
-    co_return result * 2;
-}
-
-QFuture<void> doWorkAsync() {
-    co_await QtConcurrent::run([] { doWork(); });
-    co_return;
-}
-
-// Await signals
-QFuture<Result> handleReply(QNetworkReply * reply) {
-    co_await QtFuture::connect(reply, &QNetworkReply::finished);
-    auto result = processReply(reply);
-    co_return result;
-}
-```
-
-### `qtcoroutine/qtcoroutine.hpp`
+A C++23 coroutine library for Qt 6. Header-only, designed to make asynchronous Qt code read like sequential code.
 
 ```cpp
 #include <qtcoroutine/qtcoroutine.hpp>
-using namespace QtCoroutine;
+#include <qtcoroutine/qtask.hpp>
 
-QTask<int> computeAsync() {
-    auto task = QTask<int>::fromFuture(QtConcurrent::run([] { return 42; }));
-    int result = co_await task;
-    co_return result * 2;
+QtCoroutine::QTask<QByteArray> fetchData(QNetworkAccessManager & nam, QUrl url, std::stop_token st) {
+    auto * reply = nam.get(QNetworkRequest{url});
+
+    co_await QtCoroutine::signal(reply, &QNetworkReply::finished)
+        .cancelledBy(st)
+        .withTimeout(std::chrono::seconds(30));
+
+    auto data = reply->readAll();
+    reply->deleteLater();
+    co_return data;
 }
-
-QTask<void> doWorkAsync() {
-    auto task = QTask<void>::fromFuture(QtConcurrent::run([] { doWork(); }));
-    co_await task;
-    co_return;
-}
-
-// Await signals
-QTask<Result> handleReply(QNetworkReply *reply) {
-    co_await QtCoroutine::connect(reply, &QNetworkReply::finished);
-    auto result = processReply(reply);
-    co_return result;
-}
-
-// Blocking access (similar to QFuture)
-auto task = computeAsync();
-int value = task.result();  // blocks until ready
 ```
 
-Both headers use `QFutureWatcher` to suspend and resume coroutines through the Qt event loop, ensuring thread-safe signal/slot integration.
+## Features
+
+### Awaitable Qt Signals
+
+`co_await` any Qt signal with a chainable builder API:
+
+```cpp
+// Void signal
+co_await QtCoroutine::signal(&button, &QPushButton::clicked);
+
+// Signal with arguments — automatically unwrapped
+auto text = co_await QtCoroutine::signal(&edit, &QLineEdit::textChanged);
+
+// Structured bindings for multi-arg signals
+auto [id, name] = co_await QtCoroutine::signal(&api, &Api::userCreated);
+
+// Full builder chain
+auto result = co_await QtCoroutine::signal(&obj, &Obj::finished)
+    .resumeOn(&context)                    // resume on a specific thread
+    .cancelledBy(stopToken)                // cancellation via std::stop_token
+    .withTimeout(std::chrono::seconds(5))  // timeout support
+    .readyIf([](Obj * o) -> std::optional<int> {  // skip if already ready
+        if (o->hasResult()) return o->result();
+        return std::nullopt;
+    });
+```
+
+### QTask — Coroutine Return Type
+
+`QTask<T>` is a coroutine type with continuations, cancellation state, and QFuture bridging:
+
+```cpp
+QtCoroutine::QTask<int> compute() {
+    co_await QtCoroutine::sleep(std::chrono::seconds(1));
+    co_return 42;
+}
+
+// From non-coroutine code
+auto task = compute();
+task.then([](int val) { qDebug() << val; });
+task.onCancelled([](const auto & err) { qWarning() << err.message(); });
+task.onError([](std::exception_ptr ep) { /* handle */ });
+
+// Bridge to QFuture for QFutureWatcher, QtFuture::whenAll, etc.
+QFuture<int> future = task.toFuture();
+```
+
+### QFuture as Coroutine Return Type
+
+Functions returning `QFuture<T>` are automatically coroutines:
+
+```cpp
+#include <qtcoroutine/qfuture_coroutine_traits.hpp>
+
+QFuture<int> pipeline() {
+    auto raw = co_await QtConcurrent::run([] { return fetchRawData(); });
+    auto processed = co_await QtConcurrent::run([&] { return process(raw); });
+    co_return processed;
+}
+```
+
+### Value-Based Error Handling
+
+Opt into `std::expected` instead of exceptions with `.asExpected()`:
+
+```cpp
+auto result = co_await QtCoroutine::signal(&obj, &Obj::finished)
+    .cancelledBy(st)
+    .asExpected();
+
+if (!result) {
+    qWarning() << result.error().message();  // "Stop request received"
+    co_return;
+}
+auto value = *result;
+```
+
+### Combinators
+
+```cpp
+// Wait for all tasks
+auto [r1, r2, r3] = co_await QtCoroutine::whenAll(task1, task2, task3);
+
+// Wait for first to complete
+auto winner = co_await QtCoroutine::whenAny(task1, task2);
+
+// Sleep
+co_await QtCoroutine::sleep(std::chrono::milliseconds(500));
+```
+
+## Headers
+
+| Header | Purpose |
+|--------|---------|
+| `qtcoroutine/qtcoroutine.hpp` | Signal awaiting, builder pattern, `sleep()` |
+| `qtcoroutine/qtask.hpp` | `QTask<T>`, `whenAll`, `whenAny` |
+| `qtcoroutine/qfuture_coroutine_traits.hpp` | `QFuture<T>` as coroutine return type + `co_await` |
+| `qtcoroutine/utils.hpp` | Type utilities, `AwaitCancelled` |
+
+## Cancellation
+
+The library uses `std::stop_token` for cancellation, which propagates automatically through coroutine chains via `AwaitCancelled` exceptions. QTask catches these and stores them as state:
+
+```cpp
+QtCoroutine::QTask<void> work(std::stop_token st) {
+    // AwaitCancelled propagates automatically if st is cancelled
+    co_await QtCoroutine::signal(&obj, &Obj::step1Done).cancelledBy(st);
+    co_await QtCoroutine::signal(&obj, &Obj::step2Done).cancelledBy(st);
+}
+
+auto task = work(stopSource.get_token());
+stopSource.request_stop();  // cancels wherever the coroutine is suspended
+
+// From non-coroutine code
+if (task.isCancelled())
+    qDebug() << task.cancelReason();  // Stopped, SenderDestroyed, Timeout, etc.
+```
 
 ## Integration
 
@@ -74,16 +145,16 @@ Both headers use `QFutureWatcher` to suspend and resume coroutines through the Q
 include(FetchContent)
 FetchContent_Declare(qtcoroutine
     GIT_REPOSITORY https://github.com/goeries/qtcoroutine.git
-    GIT_TAG v1.0.0
+    GIT_TAG v0.1.0-alpha
 )
 FetchContent_MakeAvailable(qtcoroutine)
 
 target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
 ```
 
-### Subdirectory
+This automatically sets up include paths, C++23, and Qt6 dependencies.
 
-Clone or add as a git submodule, then:
+### Subdirectory
 
 ```cmake
 add_subdirectory(qtcoroutine)
@@ -92,12 +163,22 @@ target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
 
 ### Copy headers
 
-Copy the `include/qtcoroutine/` directory into your project and add the parent directory to your include path.
+Copy `include/qtcoroutine/` into your project and add to your include path:
+
+```cmake
+target_include_directories(myapp PRIVATE path/to/include)
+target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
+```
 
 ## Requirements
 
-- C++20 or later (coroutine support)
+- C++23 (GCC 13+, Clang 16+, MSVC 2022 17.5+)
 - Qt 6
+- CMake 3.22+
+
+## Naming: `signal()` vs `connect()`
+
+Both `QtCoroutine::signal()` and `QtCoroutine::connect()` are identical. Prefer `signal()` — it avoids name collisions with `QtFuture::connect` when both namespaces are imported via `using namespace`.
 
 ## Tested On
 

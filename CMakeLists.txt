@@ -1,9 +1,11 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.22)
 
 project(qtcoroutine
-    VERSION 1.0.0
+    VERSION 0.1.0
     LANGUAGES CXX
 )
+
+# --- Interface library (what consumers link against) ---
 
 add_library(qtcoroutine INTERFACE)
 add_library(qtcoroutine::qtcoroutine ALIAS qtcoroutine)
@@ -13,9 +15,13 @@ target_include_directories(qtcoroutine INTERFACE
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-target_compile_features(qtcoroutine INTERFACE cxx_std_20)
+target_compile_features(qtcoroutine INTERFACE cxx_std_23)
 
-# Install
+find_package(Qt6 REQUIRED COMPONENTS Core Concurrent)
+target_link_libraries(qtcoroutine INTERFACE Qt6::Core Qt6::Concurrent)
+
+# --- Install ---
+
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
@@ -33,15 +39,13 @@ install(EXPORT qtcoroutineTargets
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qtcoroutine
 )
 
-configure_package_config_file(
-    cmake/qtcoroutineConfig.cmake.in
-    ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfig.cmake
-    INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qtcoroutine
-)
-
 write_basic_package_version_file(
     ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfigVersion.cmake
     COMPATIBILITY SameMajorVersion
+)
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfig.cmake
+    "include(\"\${CMAKE_CURRENT_LIST_DIR}/qtcoroutineTargets.cmake\")\n"
 )
 
 install(FILES
@@ -50,15 +54,17 @@ install(FILES
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qtcoroutine
 )
 
-# Examples
-option(QTCOROUTINE_BUILD_EXAMPLES "Build example applications" OFF)
-if(QTCOROUTINE_BUILD_EXAMPLES)
-    add_subdirectory(examples)
-endif()
+# --- Tests (opt-in) ---
 
-# Tests
 option(QTCOROUTINE_BUILD_TESTS "Build tests" OFF)
 if(QTCOROUTINE_BUILD_TESTS)
     enable_testing()
-    add_subdirectory(tests)
+
+    set(CMAKE_AUTOMOC ON)
+
+    find_package(Qt6 REQUIRED COMPONENTS Network)
+
+    add_executable(qtcoroutine-tests tests/test_core.cpp)
+    target_link_libraries(qtcoroutine-tests PRIVATE qtcoroutine::qtcoroutine Qt6::Network)
+    add_test(NAME core COMMAND qtcoroutine-tests)
 endif()

@@ -1,188 +1,341 @@
 #pragma once
+#include <atomic>
+#include <chrono>
+#include <concepts>
 #include <coroutine>
-#include <QFuture>
-#include <QFutureWatcher>
+#include <expected>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <QObject>
+#include <QThread>
+#include <QTimer>
+#include <QException>
+#include <stop_token>
+#include "utils.hpp"
 
 namespace QtCoroutine {
 
-template<typename T>
-class QTask {
+namespace detail {
+
+template<typename F, typename Sender, typename Signal>
+concept ValidReadyCheck =
+    std::is_same_v<std::remove_cvref_t<F>, std::nullptr_t> ||
+    (std::invocable<F, Sender *> &&
+     std::convertible_to<std::invoke_result_t<F, Sender *>,
+                         utils::ReadyCheckResultT<Signal>>);
+
+}  // namespace detail
+
+// ------------------------------------------------------------------
+// ExpectedAwaitable – wraps any awaitable so await_resume returns
+// std::expected<T, AwaitCancelled> instead of throwing.
+// ------------------------------------------------------------------
+
+template<typename Awaitable>
+class ExpectedAwaitable {
+    using ResumeT = decltype(std::declval<Awaitable &>().await_resume());
+
 public:
-    struct promise_type {
-        QTask<T> get_return_object() noexcept {
-            return QTask<T>::fromFuture(std::move(qpromise.future()));
-        }
+    using ExpectedT = std::expected<ResumeT, utils::AwaitCancelled>;
 
-        std::suspend_never initial_suspend() noexcept {
-            qpromise.start();
-            return {};
-        }
+    explicit ExpectedAwaitable(Awaitable && inner)
+        : m_inner(std::move(inner)) {}
 
-        std::suspend_never final_suspend() noexcept {
-            return {};
-        }
+    bool await_ready() { return m_inner.await_ready(); }
 
-        void return_value(const T & value) noexcept {
-            qpromise.addResult(value);
-            qpromise.finish();
-        }
-
-        void unhandled_exception() noexcept {
-            qpromise.setException(std::current_exception());
-            qpromise.finish();
-        }
-
-        QPromise<T> qpromise;
-    };
-
-    static QTask<T> fromFuture(QFuture<T> && future) {
-        return QTask<T>(std::move(future));
+    auto await_suspend(std::coroutine_handle<> handle) {
+        return m_inner.await_suspend(handle);
     }
 
-    bool await_ready() const noexcept {
-        return m_future.isFinished();
-    }
-
-    void await_suspend(std::coroutine_handle<> handle) {
-        // m_handle = handle;  // Reserved for future use (e.g. cancellation support)
-
-        // Lambda will only execute if watcher still exists (thus tied to lifetime of QTask instance)
-        m_connection = QObject::connect(&m_watcher, &QFutureWatcher<T>::finished,
-                                        &m_watcher, [handle]() {
-                                            handle.resume();
-                                        });
-
-        m_watcher.setFuture(m_future);
-    }
-
-    [[nodiscard]] T result() {
-        m_future.waitForFinished();
-        if (m_future.isValid())
-            return m_future.result();
-        else
-            throw std::runtime_error("QTask cannot get result of invalid QFuture");
-    }
-
-    void waitForFinished() {
-        m_future.waitForFinished();
-    }
-
-    bool isFinished() const noexcept {
-        return m_future.isFinished();
-    }
-
-    // Qt wraps exceptions in QUnhandledException when propagating across threads via QFuture.
-    // We unwrap and rethrow the original exception so callers get natural exception propagation.
-    [[nodiscard]] T await_resume() {
+    ExpectedT await_resume() {
         try {
-            m_future.waitForFinished();
-        } catch (QUnhandledException & e) {
-            if (e.exception())
-                std::rethrow_exception(e.exception());
-        }
-
-        if (m_future.isValid())
-            return m_future.takeResult();
-        else
-            throw std::runtime_error("QTask cannot await_resume invalid QFuture");
-
-    }
-
-private:
-    QTask(QFuture<T> && future)
-        : m_future(future)
-    {}
-
-    // std::coroutine_handle<> m_handle;  // Reserved for future use
-    QFuture<T> m_future;
-    QFutureWatcher<T> m_watcher;
-    QMetaObject::Connection m_connection;
-};
-
-// Void specialization
-template<>
-class QTask<void> {
-public:
-    struct promise_type {
-        QTask<void> get_return_object() noexcept {
-            return QTask<void>::fromFuture(std::move(qpromise.future()));
-        }
-
-        std::suspend_never initial_suspend() noexcept {
-            qpromise.start();
-            return {};
-        }
-
-        std::suspend_never final_suspend() noexcept {
-            return {};
-        }
-
-        void return_void() noexcept {
-            qpromise.finish();
-        }
-
-        void unhandled_exception() noexcept {
-            qpromise.setException(std::current_exception());
-            qpromise.finish();
-        }
-
-        QPromise<void> qpromise;
-    };
-
-    static QTask<void> fromFuture(QFuture<void> && future) {
-        return QTask<void>(std::move(future));
-    }
-
-    bool await_ready() const noexcept {
-        return m_future.isFinished();
-    }
-
-    void await_suspend(std::coroutine_handle<> handle) {
-        // m_handle = handle;  // Reserved for future use (e.g. cancellation support)
-
-        // Lambda will only execute if watcher still exists (thus tied to lifetime of QTask instance)
-        m_connection = QObject::connect(&m_watcher, &QFutureWatcher<void>::finished,
-                                        &m_watcher, [handle]() {
-                                            handle.resume();
-                                        });
-
-        m_watcher.setFuture(m_future);
-    }
-
-    void waitForFinished() {
-        m_future.waitForFinished();
-    }
-
-    bool isFinished() const noexcept {
-        return m_future.isFinished();
-    }
-
-    // Qt wraps exceptions in QUnhandledException when propagating across threads via QFuture.
-    // We unwrap and rethrow the original exception so callers get natural exception propagation.
-    void await_resume() {
-        try {
-            m_future.waitForFinished();
-        } catch (QUnhandledException & e) {
-            if (e.exception())
-                std::rethrow_exception(e.exception());
+            if constexpr (std::is_void_v<ResumeT>) {
+                m_inner.await_resume();
+                return {};
+            } else {
+                return m_inner.await_resume();
+            }
+        } catch (utils::AwaitCancelled & e) {
+            return std::unexpected(e);
         }
     }
 
 private:
-    QTask(QFuture<void> && future)
-        : m_future(future)
-    {}
-
-    // std::coroutine_handle<> m_handle;  // Reserved for future use
-    QFuture<void> m_future;
-    QFutureWatcher<void> m_watcher;
-    QMetaObject::Connection m_connection;
+    Awaitable m_inner;
 };
 
-template<typename Sender, typename Signal, typename = QtPrivate::EnableIfInvocable<Sender, Signal>>
-QTask<QtFuture::ArgsType<Signal>> connect(Sender *sender, Signal signal) {
-    auto future = QtFuture::connect(sender, signal);
-    return QTask<QtFuture::ArgsType<Signal>>::fromFuture(std::move(future));
+// ------------------------------------------------------------------
+// SignalAwaitable – awaitable + builder for co_await-ing Qt signals
+// ------------------------------------------------------------------
+
+template<typename Sender, typename Signal, typename ReadyCheck = std::nullptr_t>
+    requires std::derived_from<Sender, QObject>
+class SignalAwaitable {
+    using Args = utils::SignalArgs<Signal>;
+    using Tuple = typename Args::tuple_type;
+    using StopCallback = std::stop_callback<std::function<void()>>;
+
+public:
+    SignalAwaitable(Sender * sender, Signal signal)
+        : m_sender(sender), m_signal(signal) {}
+
+    // Destructor disconnects any active Qt connections. Ensures that if
+    // the coroutine frame is destroyed while suspended (e.g. task goes out
+    // of scope), signal callbacks don't fire into dead memory.
+    ~SignalAwaitable() { cleanup(); }
+
+    SignalAwaitable(const SignalAwaitable &) = delete;
+    SignalAwaitable & operator=(const SignalAwaitable &) = delete;
+    SignalAwaitable(SignalAwaitable &&) = default;
+    SignalAwaitable & operator=(SignalAwaitable &&) = default;
+
+    // ---- Builder methods (rvalue-qualified for safe chaining) ----
+
+    SignalAwaitable resumeOn(QObject * ctx) && {
+        m_resumeCtx = ctx;
+        return std::move(*this);
+    }
+
+    SignalAwaitable cancelledBy(std::stop_token st) && {
+        m_stop = std::move(st);
+        return std::move(*this);
+    }
+
+    SignalAwaitable withTimeout(std::chrono::milliseconds ms) && {
+        m_timeout = ms;
+        return std::move(*this);
+    }
+
+    ExpectedAwaitable<SignalAwaitable> asExpected() && {
+        return ExpectedAwaitable<SignalAwaitable>(std::move(*this));
+    }
+
+    template<typename F>
+        requires std::invocable<std::decay_t<F>, Sender *> &&
+                 std::convertible_to<std::invoke_result_t<std::decay_t<F>, Sender *>,
+                                     utils::ReadyCheckResultT<Signal>>
+    SignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
+        return {m_sender, m_signal, m_resumeCtx,
+                std::move(m_stop), std::forward<F>(check)};
+    }
+
+    // ---- Awaitable interface ----
+
+    bool await_ready() {
+        if (m_stop.stop_requested())
+            return true;
+
+        if constexpr (!std::is_same_v<ReadyCheck, std::nullptr_t>) {
+            auto checkResult = std::invoke(m_ready, m_sender);
+            if constexpr (Args::count == 0) {
+                return static_cast<bool>(checkResult);
+            } else {
+                if (checkResult) {
+                    m_result.emplace(std::move(*checkResult));
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                   "co_await SignalAwaitable",
+                   "co_await requires a running event loop on the co_await thread");
+
+        QObject * ctx = m_resumeCtx ? m_resumeCtx : m_sender;
+
+        Q_ASSERT_X(ctx->thread()->eventDispatcher(),
+                   "co_await SignalAwaitable",
+                   "co_await requires a running event loop on the resuming thread");
+
+        // Guard: multiple callbacks could fire near-simultaneously across
+        // threads. Atomic exchange ensures exactly one calls handle.resume().
+        auto guard = std::make_shared<std::atomic<bool>>(false);
+
+        // If signal fires, resume coroutine
+        m_signalConnection =
+            QObject::connect(m_sender, m_signal, ctx,
+                             [this, handle, guard](auto && ... args) mutable {
+                                 if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                                 cleanup();
+                                 m_result.emplace(std::forward<decltype(args)>(args)...);
+                                 handle.resume();
+                             });
+
+        // If sender goes out of scope first, clean up coroutine.
+        // Using ctx ensures delivery on the correct thread when
+        // resumeCtx lives on a different thread than sender.
+        m_senderDestroyedConnection =
+            QObject::connect(m_sender, &QObject::destroyed, ctx,
+                             [this, handle, guard]() mutable {
+                                 if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                                 cleanup();
+                                 m_senderDestroyed = true;
+                                 handle.resume();
+                             });
+
+        // If resumeContext goes out of scope first, clean up coroutine
+        if (m_resumeCtx)
+            m_resumeContextDestroyedConnection =
+                QObject::connect(m_resumeCtx, &QObject::destroyed,
+                                 [this, handle, guard]() mutable {
+                                     if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                                     cleanup();
+                                     m_resumeContextDestroyed = true;
+                                     handle.resume();
+                                 });
+
+        // If coroutine cancelled first, clean up coroutine
+        if (m_stop.stop_possible()) {
+            m_stopCallback = std::make_unique<StopCallback>(
+                m_stop, [this, handle, ctx, guard]() mutable {
+                    // Early check: skip invokeMethod if another callback already
+                    // won the race, avoiding a call on a potentially-destroyed ctx.
+                    if (guard->load(std::memory_order_acquire)) return;
+                    QMetaObject::invokeMethod(ctx,
+                                              [this, handle, guard]() mutable {
+                                                  if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                                                  cleanup();
+                                                  m_cancelled = true;
+                                                  handle.resume();
+                                              }, Qt::QueuedConnection);
+                });
+        }
+
+        // If timeout specified, start timer
+        if (m_timeout) {
+            m_timeoutTimer = std::make_unique<QTimer>();
+            m_timeoutTimer->setSingleShot(true);
+            QObject::connect(m_timeoutTimer.get(), &QTimer::timeout, ctx,
+                             [this, handle, guard]() mutable {
+                                 if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                                 cleanup();
+                                 m_timedOut = true;
+                                 handle.resume();
+                             });
+            m_timeoutTimer->start(static_cast<int>(m_timeout->count()));
+        }
+    }
+
+    void await_resume()
+        requires (Args::count == 0) {
+        if (m_cancelled)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Stopped};
+        else if (m_timedOut)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Timeout};
+        else if (m_senderDestroyed)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::SenderDestroyed};
+        else if (m_resumeContextDestroyed)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::ResumeContextDestroyed};
+    }
+
+    [[nodiscard("co_await result contains signal args")]]
+    utils::ConnectResultT<Signal> await_resume()
+        requires (Args::count > 0) {
+        if (m_cancelled)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Stopped};
+        else if (m_timedOut)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Timeout};
+        else if (m_senderDestroyed)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::SenderDestroyed};
+        else if (m_resumeContextDestroyed)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::ResumeContextDestroyed};
+
+        if constexpr (Args::count == 1)
+            return std::get<0>(std::move(*m_result));
+        else
+            return std::move(*m_result);
+    }
+
+private:
+    // readyIf() constructs a SignalAwaitable with a different ReadyCheck type
+    template<typename S, typename Sig, typename RC>
+        requires std::derived_from<S, QObject>
+    friend class SignalAwaitable;
+
+    SignalAwaitable(Sender * sender, Signal signal, QObject * resumeCtx,
+                    std::stop_token stop, ReadyCheck ready)
+        : m_sender(sender), m_signal(signal), m_resumeCtx(resumeCtx),
+          m_stop(std::move(stop)), m_ready(std::move(ready)) {}
+
+    void cleanup() {
+        QObject::disconnect(m_signalConnection);
+        QObject::disconnect(m_senderDestroyedConnection);
+        QObject::disconnect(m_resumeContextDestroyedConnection);
+        m_stopCallback.reset();
+        if (m_timeoutTimer) m_timeoutTimer->stop();
+    }
+
+    Sender * m_sender;
+    Signal m_signal;
+    QObject * m_resumeCtx = nullptr;
+    std::stop_token m_stop;
+    [[no_unique_address]] ReadyCheck m_ready;
+
+    std::optional<Tuple> m_result;
+    QMetaObject::Connection m_signalConnection;
+    QMetaObject::Connection m_senderDestroyedConnection;
+    QMetaObject::Connection m_resumeContextDestroyedConnection;
+    std::unique_ptr<StopCallback> m_stopCallback;
+    std::optional<std::chrono::milliseconds> m_timeout;
+    std::unique_ptr<QTimer> m_timeoutTimer;
+    bool m_cancelled = false;
+    bool m_timedOut = false;
+    bool m_senderDestroyed = false;
+    bool m_resumeContextDestroyed = false;
+};
+
+// ------------------------------------------------------------------
+// signal() – builder entry point (preferred API)
+// ------------------------------------------------------------------
+
+template<typename Sender, typename Signal>
+    requires std::derived_from<Sender, QObject>
+auto signal(Sender * sender, Signal sig) {
+    return SignalAwaitable<Sender, Signal>(sender, sig);
+}
+
+// ------------------------------------------------------------------
+// connect() – alias for signal(), familiar to QObject/QtFuture users.
+// Prefer signal() to avoid collisions with QtFuture::connect when
+// both namespaces are imported via using-directives.
+// ------------------------------------------------------------------
+
+template<typename Sender, typename Signal>
+    requires std::derived_from<Sender, QObject>
+auto connect(Sender * sender, Signal sig) {
+    return SignalAwaitable<Sender, Signal>(sender, sig);
+}
+
+// ------------------------------------------------------------------
+// sleep() – suspend for a duration (wraps QTimer::singleShot)
+// ------------------------------------------------------------------
+
+inline auto sleep(std::chrono::milliseconds ms) {
+    struct SleepAwaitable {
+        std::chrono::milliseconds duration;
+
+        bool await_ready() const noexcept {
+            return duration <= std::chrono::milliseconds::zero();
+        }
+
+        void await_suspend(std::coroutine_handle<> handle) {
+            Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                       "co_await sleep",
+                       "co_await requires a running event loop on this thread");
+            QTimer::singleShot(duration, [handle]() mutable {
+                handle.resume();
+            });
+        }
+
+        void await_resume() const noexcept {}
+    };
+
+    return SleepAwaitable{ms};
 }
 
 }  // namespace QtCoroutine

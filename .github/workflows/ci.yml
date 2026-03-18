@@ -19,7 +19,7 @@ jobs:
           version: '6.8.*'
 
       - name: Configure
-        run: cmake -B build -DQTCOROUTINE_BUILD_TESTS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build
