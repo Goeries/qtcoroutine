@@ -139,13 +139,35 @@ if (task.isCancelled())
 
 ## Integration
 
+### FetchContent (recommended)
+
+```cmake
+include(FetchContent)
+FetchContent_Declare(qtcoroutine
+    GIT_REPOSITORY https://github.com/goeries/qtcoroutine.git
+    GIT_TAG v0.1.0-alpha
+)
+FetchContent_MakeAvailable(qtcoroutine)
+
+target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
+```
+
+This automatically sets up include paths, C++23, and Qt6 dependencies.
+
+### Subdirectory
+
+```cmake
+add_subdirectory(qtcoroutine)
+target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
+```
+
 ### Copy headers
 
 Copy `include/qtcoroutine/` into your project and add to your include path:
 
 ```cmake
 target_include_directories(myapp PRIVATE path/to/include)
-target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)  # Concurrent only if using QFuture traits
+target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
 ```
 
 ## Requirements

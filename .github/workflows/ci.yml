@@ -20,7 +20,7 @@ jobs:
           modules: 'qtconcurrent'
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON
 
       - name: Build
         run: cmake --build build

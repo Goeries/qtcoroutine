@@ -1,37 +1,70 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(qtcoroutine-test LANGUAGES CXX)
-
-set(CMAKE_AUTOUIC ON)
-set(CMAKE_AUTOMOC ON)
-set(CMAKE_AUTORCC ON)
-
-set(CMAKE_CXX_STANDARD 23)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-find_package(QT NAMES Qt6 Qt5 REQUIRED COMPONENTS Core)
-find_package(Qt${QT_VERSION_MAJOR} REQUIRED COMPONENTS Core Network Concurrent)
-
-add_executable(qtcoroutine-test
-  main.cpp
-  include/qtcoroutine/qtcoroutine.hpp
-
-  include/qtcoroutine/qfuture_coroutine_traits.hpp
-  include/qtcoroutine/qtask.hpp
-  include/qtcoroutine/utils.hpp
+project(qtcoroutine
+    VERSION 0.1.0
+    LANGUAGES CXX
 )
-target_link_libraries(qtcoroutine-test PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Network Qt${QT_VERSION_MAJOR}::Concurrent)
 
-enable_testing()
+# --- Interface library (what consumers link against) ---
 
-add_executable(qtcoroutine-tests
-    tests/test_core.cpp
+add_library(qtcoroutine INTERFACE)
+add_library(qtcoroutine::qtcoroutine ALIAS qtcoroutine)
+
+target_include_directories(qtcoroutine INTERFACE
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(qtcoroutine-tests PRIVATE Qt${QT_VERSION_MAJOR}::Core Qt${QT_VERSION_MAJOR}::Network Qt${QT_VERSION_MAJOR}::Concurrent)
-add_test(NAME core COMMAND qtcoroutine-tests)
+
+target_compile_features(qtcoroutine INTERFACE cxx_std_23)
+
+find_package(Qt6 REQUIRED COMPONENTS Core Concurrent)
+target_link_libraries(qtcoroutine INTERFACE Qt6::Core Qt6::Concurrent)
+
+# --- Install ---
 
 include(GNUInstallDirs)
-install(TARGETS qtcoroutine-test
-    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+include(CMakePackageConfigHelpers)
+
+install(TARGETS qtcoroutine
+    EXPORT qtcoroutineTargets
 )
+
+install(DIRECTORY include/qtcoroutine
+    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
+)
+
+install(EXPORT qtcoroutineTargets
+    FILE qtcoroutineTargets.cmake
+    NAMESPACE qtcoroutine::
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qtcoroutine
+)
+
+write_basic_package_version_file(
+    ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfigVersion.cmake
+    COMPATIBILITY SameMajorVersion
+)
+
+file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfig.cmake
+    "include(\"\${CMAKE_CURRENT_LIST_DIR}/qtcoroutineTargets.cmake\")\n"
+)
+
+install(FILES
+    ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfig.cmake
+    ${CMAKE_CURRENT_BINARY_DIR}/qtcoroutineConfigVersion.cmake
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/qtcoroutine
+)
+
+# --- Tests (opt-in) ---
+
+option(QTCOROUTINE_BUILD_TESTS "Build tests" OFF)
+if(QTCOROUTINE_BUILD_TESTS)
+    enable_testing()
+
+    set(CMAKE_AUTOMOC ON)
+
+    find_package(Qt6 REQUIRED COMPONENTS Network)
+
+    add_executable(qtcoroutine-tests tests/test_core.cpp)
+    target_link_libraries(qtcoroutine-tests PRIVATE qtcoroutine::qtcoroutine Qt6::Network)
+    add_test(NAME core COMMAND qtcoroutine-tests)
+endif()
