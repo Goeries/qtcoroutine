@@ -17,9 +17,10 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.*'
+          modules: 'qtconcurrent'
 
       - name: Configure
-        run: cmake -B build -DQTCOROUTINE_BUILD_TESTS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug
 
       - name: Build
         run: cmake --build build
