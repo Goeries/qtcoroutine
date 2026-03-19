@@ -1,4 +1,4 @@
-# qtcoroutine
+# QtCoroutine
 
 A C++23 coroutine library for Qt 6. Header-only, designed to make asynchronous Qt code read like sequential code.
 
