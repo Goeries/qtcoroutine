@@ -3,8 +3,7 @@
 A C++23 coroutine library for Qt 6. Header-only, designed to make asynchronous Qt code read like sequential code.
 
 ```cpp
-#include <qtcoroutine/qtcoroutine.hpp>
-#include <qtcoroutine/qtask.hpp>
+#include <QtCoroutine>
 
 QtCoroutine::QTask<QByteArray> fetchData(QNetworkAccessManager & nam, QUrl url, std::stop_token st) {
     auto * reply = nam.get(QNetworkRequest{url});
@@ -71,7 +70,7 @@ QFuture<int> future = task.toFuture();
 Functions returning `QFuture<T>` are automatically coroutines:
 
 ```cpp
-#include <qtcoroutine/qfuture_coroutine_traits.hpp>
+#include <QtCoroutine/QFutureCoroutineTraits>
 
 QFuture<int> pipeline() {
     auto raw = co_await QtConcurrent::run([] { return fetchRawData(); });
@@ -163,7 +162,7 @@ target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
 
 ### Copy headers
 
-Copy `include/qtcoroutine/` into your project and add to your include path:
+Copy `include/QtCoroutine/` into your project and add to your include path:
 
 ```cmake
 target_include_directories(myapp PRIVATE path/to/include)
