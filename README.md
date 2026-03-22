@@ -95,6 +95,21 @@ if (!result) {
 auto value = *result;
 ```
 
+`QTask` also works directly with `std::expected` as a return type:
+
+```cpp
+QTask<std::expected<void, QString>> tryConnect(Client & c, std::stop_token st) {
+    auto reply = co_await QtCoroutine::signal(&c, &Client::connected)
+        .cancelledBy(st)
+        .asExpected();
+
+    if (!reply)
+        co_return std::unexpected{reply.error().message()};
+
+    co_return {};  // success — use {} instead of bare co_return
+}
+```
+
 ### Combinators
 
 ```cpp
