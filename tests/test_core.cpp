@@ -7,9 +7,7 @@
 #include <iostream>
 #include <stdexcept>
 
-#include "../include/qtcoroutine/qtcoroutine.hpp"
-#include "../include/qtcoroutine/qfuture_coroutine_traits.hpp"
-#include "../include/qtcoroutine/qtask.hpp"
+#include <QtCoroutine>
 
 // ---- Test helper ----
 
@@ -974,7 +972,7 @@ void test_qtask_destroyed_while_suspended(QCoreApplication & app) {
     }
 
     // Emit signal into the void — connections should have been cleaned up
-    // by SignalAwaitable destructor. No crash.
+    // by QSignalAwaitable destructor. No crash.
     emit e.voidSignal();
 
     QTimer::singleShot(50, [&]() {

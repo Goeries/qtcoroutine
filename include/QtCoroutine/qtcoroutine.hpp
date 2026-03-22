@@ -66,56 +66,56 @@ private:
 };
 
 // ------------------------------------------------------------------
-// SignalAwaitable – awaitable + builder for co_await-ing Qt signals
+// QSignalAwaitable – awaitable + builder for co_await-ing Qt signals
 // ------------------------------------------------------------------
 
 template<typename Sender, typename Signal, typename ReadyCheck = std::nullptr_t>
     requires std::derived_from<Sender, QObject>
-class SignalAwaitable {
+class QSignalAwaitable {
     using Args = utils::SignalArgs<Signal>;
     using Tuple = typename Args::tuple_type;
     using StopCallback = std::stop_callback<std::function<void()>>;
 
 public:
-    SignalAwaitable(Sender * sender, Signal signal)
+    QSignalAwaitable(Sender * sender, Signal signal)
         : m_sender(sender), m_signal(signal) {}
 
     // Destructor disconnects any active Qt connections. Ensures that if
     // the coroutine frame is destroyed while suspended (e.g. task goes out
     // of scope), signal callbacks don't fire into dead memory.
-    ~SignalAwaitable() { cleanup(); }
+    ~QSignalAwaitable() { cleanup(); }
 
-    SignalAwaitable(const SignalAwaitable &) = delete;
-    SignalAwaitable & operator=(const SignalAwaitable &) = delete;
-    SignalAwaitable(SignalAwaitable &&) = default;
-    SignalAwaitable & operator=(SignalAwaitable &&) = default;
+    QSignalAwaitable(const QSignalAwaitable &) = delete;
+    QSignalAwaitable & operator=(const QSignalAwaitable &) = delete;
+    QSignalAwaitable(QSignalAwaitable &&) = default;
+    QSignalAwaitable & operator=(QSignalAwaitable &&) = default;
 
     // ---- Builder methods (rvalue-qualified for safe chaining) ----
 
-    SignalAwaitable resumeOn(QObject * ctx) && {
+    QSignalAwaitable resumeOn(QObject * ctx) && {
         m_resumeCtx = ctx;
         return std::move(*this);
     }
 
-    SignalAwaitable cancelledBy(std::stop_token st) && {
+    QSignalAwaitable cancelledBy(std::stop_token st) && {
         m_stop = std::move(st);
         return std::move(*this);
     }
 
-    SignalAwaitable withTimeout(std::chrono::milliseconds ms) && {
+    QSignalAwaitable withTimeout(std::chrono::milliseconds ms) && {
         m_timeout = ms;
         return std::move(*this);
     }
 
-    ExpectedAwaitable<SignalAwaitable> asExpected() && {
-        return ExpectedAwaitable<SignalAwaitable>(std::move(*this));
+    ExpectedAwaitable<QSignalAwaitable> asExpected() && {
+        return ExpectedAwaitable<QSignalAwaitable>(std::move(*this));
     }
 
     template<typename F>
         requires std::invocable<std::decay_t<F>, Sender *> &&
                  std::convertible_to<std::invoke_result_t<std::decay_t<F>, Sender *>,
                                      utils::ReadyCheckResultT<Signal>>
-    SignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
+    QSignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
         return {m_sender, m_signal, m_resumeCtx,
                 std::move(m_stop), std::forward<F>(check)};
     }
@@ -143,13 +143,13 @@ public:
 
     void await_suspend(std::coroutine_handle<> handle) {
         Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
-                   "co_await SignalAwaitable",
+                   "co_await QSignalAwaitable",
                    "co_await requires a running event loop on the co_await thread");
 
         QObject * ctx = m_resumeCtx ? m_resumeCtx : m_sender;
 
         Q_ASSERT_X(ctx->thread()->eventDispatcher(),
-                   "co_await SignalAwaitable",
+                   "co_await QSignalAwaitable",
                    "co_await requires a running event loop on the resuming thread");
 
         // Guard: multiple callbacks could fire near-simultaneously across
@@ -252,12 +252,12 @@ public:
     }
 
 private:
-    // readyIf() constructs a SignalAwaitable with a different ReadyCheck type
+    // readyIf() constructs a QSignalAwaitable with a different ReadyCheck type
     template<typename S, typename Sig, typename RC>
         requires std::derived_from<S, QObject>
-    friend class SignalAwaitable;
+    friend class QSignalAwaitable;
 
-    SignalAwaitable(Sender * sender, Signal signal, QObject * resumeCtx,
+    QSignalAwaitable(Sender * sender, Signal signal, QObject * resumeCtx,
                     std::stop_token stop, ReadyCheck ready)
         : m_sender(sender), m_signal(signal), m_resumeCtx(resumeCtx),
           m_stop(std::move(stop)), m_ready(std::move(ready)) {}
@@ -296,7 +296,7 @@ private:
 template<typename Sender, typename Signal>
     requires std::derived_from<Sender, QObject>
 auto signal(Sender * sender, Signal sig) {
-    return SignalAwaitable<Sender, Signal>(sender, sig);
+    return QSignalAwaitable<Sender, Signal>(sender, sig);
 }
 
 // ------------------------------------------------------------------
@@ -308,7 +308,7 @@ auto signal(Sender * sender, Signal sig) {
 template<typename Sender, typename Signal>
     requires std::derived_from<Sender, QObject>
 auto connect(Sender * sender, Signal sig) {
-    return SignalAwaitable<Sender, Signal>(sender, sig);
+    return QSignalAwaitable<Sender, Signal>(sender, sig);
 }
 
 // ------------------------------------------------------------------

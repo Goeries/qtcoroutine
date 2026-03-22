@@ -12,7 +12,9 @@ add_library(qtcoroutine::qtcoroutine ALIAS qtcoroutine)
 
 target_include_directories(qtcoroutine INTERFACE
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include/QtCoroutine>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/QtCoroutine>
 )
 
 target_compile_features(qtcoroutine INTERFACE cxx_std_23)
@@ -29,7 +31,7 @@ install(TARGETS qtcoroutine
     EXPORT qtcoroutineTargets
 )
 
-install(DIRECTORY include/qtcoroutine
+install(DIRECTORY include/QtCoroutine
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
 )
 
