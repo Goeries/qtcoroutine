@@ -1145,6 +1145,35 @@ void test_timeout_and_cancel_together(QCoreApplication & app) {
 }
 
 // ====================================================================
+// 38. QTask<std::expected<void, E>> — co_return {} for void expected
+// ====================================================================
+
+struct TestError { int code; };
+
+QtCoroutine::QTask<std::expected<void, TestError>> taskExpectedVoidSuccess() {
+    co_return {};  // default-constructs expected (success) — co_return; would NOT compile
+}
+
+QtCoroutine::QTask<std::expected<void, TestError>> taskExpectedVoidError() {
+    co_return std::unexpected{TestError{42}};
+}
+
+void test_qtask_expected_void() {
+    std::cout << "test_qtask_expected_void\n";
+
+    auto t1 = taskExpectedVoidSuccess();
+    TEST_ASSERT(t1.await_ready(), "expected<void> success task should be done");
+    auto r1 = t1.await_resume();
+    TEST_ASSERT(r1.has_value(), "expected<void> success should have value");
+
+    auto t2 = taskExpectedVoidError();
+    TEST_ASSERT(t2.await_ready(), "expected<void> error task should be done");
+    auto r2 = t2.await_resume();
+    TEST_ASSERT(!r2.has_value(), "expected<void> error should not have value");
+    TEST_ASSERT(r2.error().code == 42, "expected<void> error code should be 42");
+}
+
+// ====================================================================
 // main
 // ====================================================================
 
@@ -1164,6 +1193,7 @@ int main(int argc, char *argv[])
     test_whenAll_sync();
     test_whenAll_void();
     test_whenAny_immediate();
+    test_qtask_expected_void();
 
     // Async tests (need event loop)
     test_signal_void(app);

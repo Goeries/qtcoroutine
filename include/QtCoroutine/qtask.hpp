@@ -53,6 +53,11 @@ public:
             return Awaiter{};
         }
 
+        // NOTE: QTask<T> only provides return_value(), not return_void().
+        // The C++ standard forbids having both on the same promise type.
+        // This means co_return; (no operand) won't compile for non-void T.
+        // For types like std::expected<void, E>, use co_return {} instead
+        // of co_return; to default-construct the success value.
         void return_value(const T & val) {
             result.emplace(val);
             state = State::value;
