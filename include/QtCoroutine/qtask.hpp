@@ -1,14 +1,17 @@
 #pragma once
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <coroutine>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <stop_token>
 #include <tuple>
 #include <utility>
 #include <QFuture>
 #include <QPromise>
+#include <QTimer>
 #include "utils.hpp"
 
 namespace QtCoroutine {
@@ -413,17 +416,120 @@ private:
 // ------------------------------------------------------------------
 // whenAll — co_await multiple QTasks, resume when all complete.
 // Tasks are already running (eager start); this just collects results.
+// Callback-based: uses .then/.onCancelled/.onError + atomic counter.
+// Waits for ALL tasks before propagating any error or cancellation.
+// ------------------------------------------------------------------
+
+namespace detail {
+
+template<typename... Ts>
+struct WhenAllAwaitable {
+    std::tuple<QTask<Ts>*...> tasks;
+
+    bool await_ready() {
+        return std::apply([](auto*... ptrs) {
+            return (ptrs->await_ready() && ...);
+        }, tasks);
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        constexpr auto N = sizeof...(Ts);
+        auto remaining = std::make_shared<std::atomic<std::size_t>>(N);
+
+        // The last task to complete resumes the outer coroutine.
+        // If the task is already at final_suspend (done), resume directly.
+        // Otherwise, set its continuation so final_suspend resumes us —
+        // this avoids destroying a running coroutine (the callback fires
+        // from return_value, before final_suspend).
+        auto setupTask = [remaining, handle](auto* task) {
+            auto onComplete = [remaining, handle, task]() {
+                if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (task->await_ready())
+                        handle.resume();
+                    else
+                        task->await_suspend(handle);
+                }
+            };
+            task->then([onComplete](const auto&) { onComplete(); });
+            task->onCancelled([onComplete](const auto&) { onComplete(); });
+            task->onError([onComplete](auto) { onComplete(); });
+        };
+
+        std::apply([&setupTask](auto*... ptrs) {
+            (setupTask(ptrs), ...);
+        }, tasks);
+    }
+
+    std::tuple<Ts...> await_resume() {
+        return std::apply([](auto*... ptrs) {
+            return std::tuple<Ts...>{ ptrs->await_resume()... };
+        }, tasks);
+    }
+};
+
+template<std::size_t N>
+struct WhenAllVoidAwaitable {
+    std::array<QTask<void>*, N> tasks;
+
+    bool await_ready() {
+        for (auto* t : tasks)
+            if (!t->await_ready()) return false;
+        return true;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        auto remaining = std::make_shared<std::atomic<std::size_t>>(N);
+
+        for (auto* task : tasks) {
+            auto onComplete = [remaining, handle, task]() {
+                if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    if (task->await_ready())
+                        handle.resume();
+                    else
+                        task->await_suspend(handle);
+                }
+            };
+            task->then([onComplete]() { onComplete(); });
+            task->onCancelled([onComplete](const auto&) { onComplete(); });
+            task->onError([onComplete](auto) { onComplete(); });
+        }
+    }
+
+    void await_resume() {
+        for (auto* t : tasks)
+            t->await_resume();
+    }
+};
+
+}  // namespace detail
+
+template<typename... Ts>
+    requires (sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
+auto whenAll(QTask<Ts> &... tasks) {
+    return detail::WhenAllAwaitable<Ts...>{ std::tuple{&tasks...} };
+}
+
+template<std::same_as<QTask<void>>... Tasks>
+    requires (sizeof...(Tasks) > 0)
+auto whenAll(Tasks &... tasks) {
+    return detail::WhenAllVoidAwaitable<sizeof...(Tasks)>{ {&tasks...} };
+}
+
+// ------------------------------------------------------------------
+// tryAll — sequential co_await of multiple QTasks.
+// Short-circuits on the first error or cancellation (fail-fast).
+// Simpler than whenAll when you don't need all tasks to settle.
 // ------------------------------------------------------------------
 
 template<typename... Ts>
     requires (sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
-QTask<std::tuple<Ts...>> whenAll(QTask<Ts> &... tasks) {
+QTask<std::tuple<Ts...>> tryAll(QTask<Ts> &... tasks) {
     co_return std::tuple{ (co_await tasks)... };
 }
 
 template<std::same_as<QTask<void>>... Tasks>
     requires (sizeof...(Tasks) > 0)
-QTask<void> whenAll(Tasks &... tasks) {
+QTask<void> tryAll(Tasks &... tasks) {
     ((co_await tasks), ...);
 }
 
@@ -456,7 +562,10 @@ struct WhenAnyAwaitable {
             auto resume = [this, i, handle, guard]() {
                 if (guard->exchange(true, std::memory_order_acq_rel)) return;
                 readyIndex = i;
-                handle.resume();
+                if (tasks[i]->await_ready())
+                    handle.resume();
+                else
+                    tasks[i]->await_suspend(handle);
             };
             tasks[i]->then([resume](const T &) { resume(); });
             tasks[i]->onCancelled([resume](const auto &) { resume(); });
@@ -477,6 +586,150 @@ template<typename T, typename... Rest>
     requires (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
 auto whenAny(QTask<T> & first, Rest &... rest) {
     return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{ {&first, &rest...} };
+}
+
+// ------------------------------------------------------------------
+// cancelledBy — wrap a QTask with stop_token cancellation.
+// Returns a new QTask that resolves with the original result or
+// throws AwaitCancelled{Stopped} if the token is triggered first.
+// The inner task continues running (fire-and-forget).
+// ------------------------------------------------------------------
+
+namespace detail {
+
+template<typename T>
+struct CancelledByAwaitable {
+    using StopCallback = std::stop_callback<std::function<void()>>;
+
+    QTask<T> & task;
+    std::stop_token token;
+    bool cancelled = false;
+    std::unique_ptr<StopCallback> stopCb;
+
+    bool await_ready() {
+        if (token.stop_requested()) {
+            cancelled = true;
+            return true;
+        }
+        return task.await_ready();
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        auto guard = std::make_shared<std::atomic<bool>>(false);
+
+        auto resume = [this, handle, guard](bool isCancelled) {
+            if (guard->exchange(true, std::memory_order_acq_rel)) return;
+            cancelled = isCancelled;
+            handle.resume();
+        };
+
+        if constexpr (std::is_void_v<T>) {
+            task.then([resume]() { resume(false); });
+        } else {
+            task.then([resume](const T &) { resume(false); });
+        }
+        task.onCancelled([resume](const auto &) { resume(false); });
+        task.onError([resume](auto) { resume(false); });
+
+        if (token.stop_possible()) {
+            stopCb = std::make_unique<StopCallback>(
+                token, [resume]() { resume(true); });
+        }
+    }
+
+    auto await_resume() -> decltype(task.await_resume()) {
+        stopCb.reset();
+        if (cancelled)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Stopped};
+        return task.await_resume();
+    }
+};
+
+}  // namespace detail
+
+template<typename T>
+QTask<T> cancelledBy(QTask<T> & task, std::stop_token token) {
+    if constexpr (std::is_void_v<T>) {
+        co_await detail::CancelledByAwaitable<void>{task, std::move(token)};
+    } else {
+        co_return co_await detail::CancelledByAwaitable<T>{task, std::move(token)};
+    }
+}
+
+// ------------------------------------------------------------------
+// withTimeout — wrap a QTask with a timeout. Returns a new QTask
+// that resolves with the original result OR throws AwaitCancelled{Timeout}.
+// The inner task continues running after timeout (fire-and-forget).
+// ------------------------------------------------------------------
+
+namespace detail {
+
+template<typename T>
+struct TaskTimeoutAwaitable {
+    QTask<T> & task;
+    std::chrono::milliseconds ms;
+    bool timedOut = false;
+    std::unique_ptr<QTimer> timer;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    TaskTimeoutAwaitable(QTask<T> & t, std::chrono::milliseconds m)
+        : task(t), ms(m) {}
+
+    ~TaskTimeoutAwaitable() {
+        if (timer) timer->stop();
+        if (guard) guard->store(true, std::memory_order_release);
+    }
+
+    TaskTimeoutAwaitable(TaskTimeoutAwaitable &&) = default;
+    TaskTimeoutAwaitable & operator=(TaskTimeoutAwaitable &&) = default;
+
+    bool await_ready() {
+        return task.await_ready();
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        guard = std::make_shared<std::atomic<bool>>(false);
+
+        auto g = guard;
+        auto resume = [handle, g]() {
+            if (g->exchange(true, std::memory_order_acq_rel)) return;
+            handle.resume();
+        };
+
+        if constexpr (std::is_void_v<T>) {
+            task.then([resume]() { resume(); });
+        } else {
+            task.then([resume](const T &) { resume(); });
+        }
+        task.onCancelled([resume](const auto &) { resume(); });
+        task.onError([resume](auto) { resume(); });
+
+        timer = std::make_unique<QTimer>();
+        timer->setSingleShot(true);
+        QObject::connect(timer.get(), &QTimer::timeout, [this, handle, g]() {
+            if (g->exchange(true, std::memory_order_acq_rel)) return;
+            timedOut = true;
+            handle.resume();
+        });
+        timer->start(static_cast<int>(ms.count()));
+    }
+
+    auto await_resume() -> decltype(task.await_resume()) {
+        if (timedOut)
+            throw utils::AwaitCancelled{utils::AwaitCancelled::Timeout};
+        return task.await_resume();
+    }
+};
+
+}  // namespace detail
+
+template<typename T>
+QTask<T> withTimeout(QTask<T> & task, std::chrono::milliseconds ms) {
+    co_return co_await detail::TaskTimeoutAwaitable<T>(task, ms);
+}
+
+inline QTask<void> withTimeout(QTask<void> & task, std::chrono::milliseconds ms) {
+    co_await detail::TaskTimeoutAwaitable<void>(task, ms);
 }
 
 }  // namespace QtCoroutine

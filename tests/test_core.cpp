@@ -1174,6 +1174,289 @@ void test_qtask_expected_void() {
 }
 
 // ====================================================================
+// 46. cancelledBy — task completes before stop (success) (async)
+// ====================================================================
+
+QtCoroutine::QTask<int> cancelledBySuccess46(Emitter * e, std::stop_token st) {
+    auto task = awaitOneArg(e);
+    co_return co_await QtCoroutine::cancelledBy(task, st);
+}
+
+void test_cancelledBy_success(QCoreApplication & app) {
+    std::cout << "test_cancelledBy_success\n";
+
+    Emitter e;
+    std::stop_source ss;
+    auto task = cancelledBySuccess46(&e, ss.get_token());
+
+    QTimer::singleShot(10, [&]() { emit e.oneArg(42); });
+    QTimer::singleShot(50, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after signal");
+        TEST_ASSERT(task.await_resume() == 42, "should return signal value");
+        TEST_ASSERT(!task.isCancelled(), "should NOT be cancelled");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 47. cancelledBy — stop fires before task completes (async)
+// ====================================================================
+
+QtCoroutine::QTask<int> cancelledByStopped47(Emitter * e, std::stop_token st) {
+    auto task = awaitOneArg(e);
+    co_return co_await QtCoroutine::cancelledBy(task, st);
+}
+
+void test_cancelledBy_stopped(QCoreApplication & app) {
+    std::cout << "test_cancelledBy_stopped\n";
+
+    Emitter e;
+    std::stop_source ss;
+    auto task = cancelledByStopped47(&e, ss.get_token());
+
+    QTimer::singleShot(10, [&]() { ss.request_stop(); });
+    QTimer::singleShot(50, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after stop");
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped,
+                    "reason should be Stopped");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 48. cancelledBy + asExpected composition (async)
+// ====================================================================
+
+QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>>
+cancelledByExpected48(Emitter * e, std::stop_token st) {
+    auto task = awaitOneArg(e);
+    auto wrapped = QtCoroutine::cancelledBy(task, st);
+    co_return co_await QtCoroutine::ExpectedAwaitable<QtCoroutine::QTask<int>>(std::move(wrapped));
+}
+
+void test_cancelledBy_asExpected(QCoreApplication & app) {
+    std::cout << "test_cancelledBy_asExpected\n";
+
+    Emitter e;
+    std::stop_source ss;
+    auto task = cancelledByExpected48(&e, ss.get_token());
+
+    QTimer::singleShot(10, [&]() { ss.request_stop(); });
+    QTimer::singleShot(50, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after stop");
+        auto result = task.await_resume();
+        TEST_ASSERT(!result.has_value(), "should be unexpected (cancelled)");
+        TEST_ASSERT(result.error().wasStopped(), "error reason should be stopped");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 43. whenAll — one task errors, waits for all before propagating (async)
+// ====================================================================
+
+QtCoroutine::QTask<int> awaitThenThrow43(Emitter * e) {
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal);
+    throw std::runtime_error("whenAll error");
+    co_return 0;
+}
+
+QtCoroutine::QTask<std::tuple<int, int>> whenAllOneErrors43(Emitter * eThrow, Emitter * eNormal) {
+    auto t1 = awaitThenThrow43(eThrow);
+    auto t2 = awaitOneArg32b(eNormal);
+    co_return co_await QtCoroutine::whenAll(t1, t2);
+}
+
+void test_whenAll_one_errors(QCoreApplication & app) {
+    std::cout << "test_whenAll_one_errors\n";
+
+    Emitter eThrow, eNormal;
+    auto task = whenAllOneErrors43(&eThrow, &eNormal);
+
+    // t1 errors at 10ms, t2 completes at 30ms
+    QTimer::singleShot(10, [&]() { emit eThrow.voidSignal(); });
+    QTimer::singleShot(30, [&]() { emit eNormal.oneArg(22); });
+
+    // At 20ms, t1 has errored but t2 hasn't completed — task should NOT be done
+    QTimer::singleShot(20, [&]() {
+        TEST_ASSERT(!task.await_ready(), "whenAll should wait for ALL tasks even when one errors");
+    });
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after all tasks complete");
+        bool caught = false;
+        try {
+            task.await_resume();
+        } catch (const std::runtime_error & ex) {
+            caught = true;
+            TEST_ASSERT(std::string(ex.what()) == "whenAll error",
+                        "should propagate error from errored task");
+        }
+        TEST_ASSERT(caught, "whenAll should propagate error after all complete");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 44. whenAll — mixed async timing, results in declaration order (async)
+// ====================================================================
+
+QtCoroutine::QTask<std::tuple<int, int, int>> whenAllMixedTiming44(
+        Emitter * e1, Emitter * e2, Emitter * e3) {
+    auto t1 = awaitOneArg32b(e1);
+    auto t2 = awaitOneArg32b(e2);
+    auto t3 = awaitOneArg32b(e3);
+    co_return co_await QtCoroutine::whenAll(t1, t2, t3);
+}
+
+void test_whenAll_mixed_timing(QCoreApplication & app) {
+    std::cout << "test_whenAll_mixed_timing\n";
+
+    Emitter e1, e2, e3;
+    auto task = whenAllMixedTiming44(&e1, &e2, &e3);
+
+    // Complete tasks in reverse order of declaration
+    QTimer::singleShot(10, [&]() { emit e3.oneArg(33); });
+    QTimer::singleShot(20, [&]() { emit e1.oneArg(11); });
+    QTimer::singleShot(30, [&]() { emit e2.oneArg(22); });
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "whenAll should be done after all complete");
+        auto [r1, r2, r3] = task.await_resume();
+        TEST_ASSERT(r1 == 11, "first result correct despite completing second");
+        TEST_ASSERT(r2 == 22, "second result correct despite completing last");
+        TEST_ASSERT(r3 == 33, "third result correct despite completing first");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 45. tryAll — short-circuits on first error (async)
+// ====================================================================
+
+QtCoroutine::QTask<std::tuple<int, int>> tryAllShortCircuit45(Emitter * eThrow, Emitter * eNormal) {
+    auto t1 = awaitThenThrow43(eThrow);
+    auto t2 = awaitOneArg32b(eNormal);
+    co_return co_await QtCoroutine::tryAll(t1, t2);
+}
+
+void test_tryAll_short_circuits(QCoreApplication & app) {
+    std::cout << "test_tryAll_short_circuits\n";
+
+    Emitter eThrow, eNormal;
+    auto task = tryAllShortCircuit45(&eThrow, &eNormal);
+
+    // t1 errors at 10ms, t2 never completes — tryAll should still finish
+    QTimer::singleShot(10, [&]() { emit eThrow.voidSignal(); });
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "tryAll should be done after first error");
+        bool caught = false;
+        try {
+            task.await_resume();
+        } catch (const std::runtime_error & ex) {
+            caught = true;
+            TEST_ASSERT(std::string(ex.what()) == "whenAll error",
+                        "should propagate error from first failing task");
+        }
+        TEST_ASSERT(caught, "tryAll should short-circuit on first error");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 49. withTimeout (QTask) — task completes before timeout
+// ====================================================================
+
+QtCoroutine::QTask<int> withTimeoutSuccess49(Emitter * e) {
+    auto inner = awaitOneArg(e);
+    co_return co_await QtCoroutine::withTimeout(inner, std::chrono::milliseconds(500));
+}
+
+void test_withTimeout_qtask_success(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qtask_success\n";
+
+    Emitter e;
+    auto task = withTimeoutSuccess49(&e);
+
+    QTimer::singleShot(10, [&]() { emit e.oneArg(42); });
+    QTimer::singleShot(50, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after signal");
+        TEST_ASSERT(task.await_resume() == 42, "should capture signal value");
+        TEST_ASSERT(!task.isCancelled(), "should NOT be cancelled");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 50. withTimeout (QTask) — timeout fires before task completes
+// ====================================================================
+
+QtCoroutine::QTask<void> withTimeoutExpired50(Emitter * e) {
+    auto inner = awaitVoidSignal(e);
+    co_await QtCoroutine::withTimeout(inner, std::chrono::milliseconds(20));
+}
+
+void test_withTimeout_qtask_expired(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qtask_expired\n";
+
+    Emitter e;
+    auto task = withTimeoutExpired50(&e);
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after timeout");
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout,
+                    "reason should be Timeout");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 51. withTimeout (QTask) + ExpectedAwaitable composition
+// ====================================================================
+
+QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>>
+withTimeoutExpected51(Emitter * e) {
+    auto inner = awaitOneArg(e);
+    auto task = QtCoroutine::withTimeout(inner, std::chrono::milliseconds(20));
+    co_return co_await QtCoroutine::ExpectedAwaitable<QtCoroutine::QTask<int>>(std::move(task));
+}
+
+void test_withTimeout_qtask_expected(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qtask_expected\n";
+
+    Emitter e;
+    auto task = withTimeoutExpected51(&e);
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after timeout");
+        auto result = task.await_resume();
+        TEST_ASSERT(!result.has_value(), "result should not have value (timed out)");
+        TEST_ASSERT(result.error().wasTimedOut(), "error should be timeout");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
 // main
 // ====================================================================
 
@@ -1225,8 +1508,17 @@ int main(int argc, char *argv[])
     test_signal_before_coawait(app);
     test_multiple_emissions(app);
     test_whenAll_one_cancelled(app);
+    test_whenAll_one_errors(app);
+    test_whenAll_mixed_timing(app);
+    test_tryAll_short_circuits(app);
     test_toFuture_exception(app);
     test_timeout_and_cancel_together(app);
+    test_cancelledBy_success(app);
+    test_cancelledBy_stopped(app);
+    test_cancelledBy_asExpected(app);
+    test_withTimeout_qtask_success(app);
+    test_withTimeout_qtask_expired(app);
+    test_withTimeout_qtask_expected(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
