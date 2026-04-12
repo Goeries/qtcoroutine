@@ -83,6 +83,10 @@ template<typename T>
             : m_future(std::move(future))
         {}
 
+        ~Awaitable() {
+            if (m_guard) m_guard->store(true, std::memory_order_release);
+        }
+
         bool await_ready() const noexcept {
             return m_future.isFinished();
         }
@@ -93,14 +97,15 @@ template<typename T>
                        "co_await QFuture",
                        "co_await requires a running event loop on this thread");
 
-            // m_handle = handle;  // Reserved for future use (e.g. cancellation support)
-
-            // Use context object as thread-affinity anchor.
-            // Safe even if future completes between await_ready() and here:
-            // Qt's .then() with a context guarantees callback delivery via the
-            // context's event loop, even for already-finished futures.
-            m_context = std::make_unique<QObject>();
-            m_future.then(m_context.get(), [handle](auto && ...) {
+            // Context is shared_ptr so the QFuture's continuation lambda keeps
+            // the QObject alive until the callback fires — even if this Awaitable
+            // (and its coroutine frame) is destroyed first (e.g. via timeout).
+            // Guard prevents handle.resume() on a destroyed coroutine.
+            auto context = std::make_shared<QObject>();
+            m_guard = std::make_shared<std::atomic<bool>>(false);
+            auto guard = m_guard;
+            m_future.then(context.get(), [handle, context, guard](auto && ...) {
+                if (guard->exchange(true, std::memory_order_acq_rel)) return;
                 handle.resume();
             });
 
@@ -156,9 +161,8 @@ template<typename T>
         }
 
     private:
-        // std::coroutine_handle<> m_handle;  // Reserved for future use
         QFuture<T> m_future;
-        std::unique_ptr<QObject> m_context;
+        std::shared_ptr<std::atomic<bool>> m_guard;
     };
 
     return Awaitable {std::move(future)};

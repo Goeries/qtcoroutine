@@ -10,7 +10,9 @@
 #include <tuple>
 #include <utility>
 #include <QFuture>
+#include <QObject>
 #include <QPromise>
+#include <QThread>
 #include <QTimer>
 #include "utils.hpp"
 
@@ -604,7 +606,20 @@ struct CancelledByAwaitable {
     QTask<T> & task;
     std::stop_token token;
     bool cancelled = false;
+    std::shared_ptr<std::atomic<bool>> guard;
     std::unique_ptr<StopCallback> stopCb;
+    std::unique_ptr<QObject> context;
+
+    CancelledByAwaitable(QTask<T> & t, std::stop_token tok)
+        : task(t), token(std::move(tok)) {}
+
+    ~CancelledByAwaitable() {
+        if (guard) guard->store(true, std::memory_order_release);
+        stopCb.reset();
+    }
+
+    CancelledByAwaitable(CancelledByAwaitable &&) = default;
+    CancelledByAwaitable & operator=(CancelledByAwaitable &&) = default;
 
     bool await_ready() {
         if (token.stop_requested()) {
@@ -615,12 +630,24 @@ struct CancelledByAwaitable {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
-        auto guard = std::make_shared<std::atomic<bool>>(false);
+        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                   "co_await cancelledBy",
+                   "co_await requires a running event loop on this thread");
 
-        auto resume = [this, handle, guard](bool isCancelled) {
-            if (guard->exchange(true, std::memory_order_acq_rel)) return;
-            cancelled = isCancelled;
-            handle.resume();
+        guard = std::make_shared<std::atomic<bool>>(false);
+        context = std::make_unique<QObject>();
+
+        auto g = guard;
+        auto ctx = context.get();
+
+        auto resume = [this, handle, g, ctx](bool isCancelled) {
+            if (g->load(std::memory_order_acquire)) return;
+            QMetaObject::invokeMethod(ctx,
+                [this, handle, g, isCancelled]() mutable {
+                    if (g->exchange(true, std::memory_order_acq_rel)) return;
+                    cancelled = isCancelled;
+                    handle.resume();
+                }, Qt::QueuedConnection);
         };
 
         if constexpr (std::is_void_v<T>) {
@@ -650,9 +677,9 @@ struct CancelledByAwaitable {
 template<typename T>
 QTask<T> cancelledBy(QTask<T> & task, std::stop_token token) {
     if constexpr (std::is_void_v<T>) {
-        co_await detail::CancelledByAwaitable<void>{task, std::move(token)};
+        co_await detail::CancelledByAwaitable<void>(task, std::move(token));
     } else {
-        co_return co_await detail::CancelledByAwaitable<T>{task, std::move(token)};
+        co_return co_await detail::CancelledByAwaitable<T>(task, std::move(token));
     }
 }
 
@@ -671,6 +698,7 @@ struct TaskTimeoutAwaitable {
     bool timedOut = false;
     std::unique_ptr<QTimer> timer;
     std::shared_ptr<std::atomic<bool>> guard;
+    std::unique_ptr<QObject> context;
 
     TaskTimeoutAwaitable(QTask<T> & t, std::chrono::milliseconds m)
         : task(t), ms(m) {}
@@ -688,12 +716,23 @@ struct TaskTimeoutAwaitable {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
+        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
+                   "co_await withTimeout",
+                   "co_await requires a running event loop on this thread");
+
         guard = std::make_shared<std::atomic<bool>>(false);
+        context = std::make_unique<QObject>();
 
         auto g = guard;
-        auto resume = [handle, g]() {
-            if (g->exchange(true, std::memory_order_acq_rel)) return;
-            handle.resume();
+        auto ctx = context.get();
+
+        auto resume = [handle, g, ctx]() {
+            if (g->load(std::memory_order_acquire)) return;
+            QMetaObject::invokeMethod(ctx,
+                [handle, g]() mutable {
+                    if (g->exchange(true, std::memory_order_acq_rel)) return;
+                    handle.resume();
+                }, Qt::QueuedConnection);
         };
 
         if constexpr (std::is_void_v<T>) {
@@ -706,11 +745,12 @@ struct TaskTimeoutAwaitable {
 
         timer = std::make_unique<QTimer>();
         timer->setSingleShot(true);
-        QObject::connect(timer.get(), &QTimer::timeout, [this, handle, g]() {
-            if (g->exchange(true, std::memory_order_acq_rel)) return;
-            timedOut = true;
-            handle.resume();
-        });
+        QObject::connect(timer.get(), &QTimer::timeout, ctx,
+                         [this, handle, g]() {
+                             if (g->exchange(true, std::memory_order_acq_rel)) return;
+                             timedOut = true;
+                             handle.resume();
+                         }, Qt::QueuedConnection);
         timer->start(static_cast<int>(ms.count()));
     }
 

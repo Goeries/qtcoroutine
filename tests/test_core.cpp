@@ -1457,6 +1457,133 @@ void test_withTimeout_qtask_expected(QCoreApplication & app) {
 }
 
 // ====================================================================
+// 52. withTimeout + QFuture-backed QTask, completes before timeout
+// ====================================================================
+
+QtCoroutine::QTask<int> taskFromQFuture() {
+    co_return co_await QtConcurrent::run([]() -> int {
+        QThread::msleep(50);
+        return 42;
+    });
+}
+
+QtCoroutine::QTask<int> withTimeoutFromFuture52() {
+    auto task = taskFromQFuture();
+    co_return co_await QtCoroutine::withTimeout(task, std::chrono::milliseconds(5000));
+}
+
+void test_withTimeout_qfuture_success(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qfuture_success\n";
+
+    auto task = withTimeoutFromFuture52();
+
+    QTimer::singleShot(500, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after QFuture completes");
+        TEST_ASSERT(task.await_resume() == 42, "should return value from future");
+        TEST_ASSERT(!task.isCancelled(), "should NOT be cancelled");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 53. withTimeout + QFuture-backed QTask, timeout fires first
+// ====================================================================
+
+QtCoroutine::QTask<int> taskFromSlowQFuture() {
+    co_return co_await QtConcurrent::run([]() -> int {
+        QThread::msleep(5000);
+        return 42;
+    });
+}
+
+QtCoroutine::QTask<void> withTimeoutFromFutureExpired53() {
+    auto task = taskFromSlowQFuture();
+    co_await QtCoroutine::withTimeout(task, std::chrono::milliseconds(50));
+}
+
+void test_withTimeout_qfuture_expired(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qfuture_expired\n";
+
+    auto task = withTimeoutFromFutureExpired53();
+
+    QTimer::singleShot(300, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after timeout");
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout,
+                    "reason should be Timeout");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 54. withTimeout + QFuture inside a QFuture<int> coroutine
+//     (exact noam-core reproduction — QFuture's suspend_never
+//     final_suspend destroys the frame on completion)
+// ====================================================================
+
+QFuture<int> futureWithTimeout54() {
+    auto task = taskFromQFuture();
+    auto wrapped = QtCoroutine::withTimeout(task, std::chrono::milliseconds(5000));
+    co_return co_await wrapped;
+}
+
+void test_withTimeout_qfuture_in_future(QCoreApplication & app) {
+    std::cout << "test_withTimeout_qfuture_in_future\n";
+
+    auto future = futureWithTimeout54();
+
+    QTimer::singleShot(500, [&]() {
+        TEST_ASSERT(future.isFinished(), "future should be finished");
+        TEST_ASSERT(future.result() == 42, "result should be 42");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 55. cancelledBy + QFuture-backed QTask, completes before stop
+// ====================================================================
+
+QtCoroutine::QTask<int> cancelledByFromFuture55(std::stop_token st) {
+    auto task = taskFromQFuture();
+    co_return co_await QtCoroutine::cancelledBy(task, st);
+}
+
+void test_cancelledBy_qfuture_success(QCoreApplication & app) {
+    std::cout << "test_cancelledBy_qfuture_success\n";
+
+    std::stop_source ss;
+    auto task = cancelledByFromFuture55(ss.get_token());
+
+    QTimer::singleShot(500, [&]() {
+        TEST_ASSERT(task.await_ready(), "should be done after QFuture completes");
+        TEST_ASSERT(task.await_resume() == 42, "should return value from future");
+        TEST_ASSERT(!task.isCancelled(), "should NOT be cancelled");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 56. withTimeout — already-completed QTask (sync edge case)
+// ====================================================================
+
+void test_withTimeout_already_complete() {
+    std::cout << "test_withTimeout_already_complete\n";
+
+    auto inner = taskReturnsValue();  // already done, 42
+    auto task = QtCoroutine::withTimeout(inner, std::chrono::milliseconds(5000));
+    TEST_ASSERT(task.await_ready(), "already-complete task should be immediately ready");
+    TEST_ASSERT(task.await_resume() == 42, "should return 42");
+}
+
+// ====================================================================
 // main
 // ====================================================================
 
@@ -1477,6 +1604,7 @@ int main(int argc, char *argv[])
     test_whenAll_void();
     test_whenAny_immediate();
     test_qtask_expected_void();
+    test_withTimeout_already_complete();
 
     // Async tests (need event loop)
     test_signal_void(app);
@@ -1519,6 +1647,10 @@ int main(int argc, char *argv[])
     test_withTimeout_qtask_success(app);
     test_withTimeout_qtask_expired(app);
     test_withTimeout_qtask_expected(app);
+    test_withTimeout_qfuture_success(app);
+    test_withTimeout_qfuture_expired(app);
+    test_withTimeout_qfuture_in_future(app);
+    test_cancelledBy_qfuture_success(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
