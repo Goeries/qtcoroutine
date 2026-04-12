@@ -110,14 +110,23 @@ QTask<std::expected<void, QString>> tryConnect(Client & c, std::stop_token st) {
 }
 ```
 
-### Combinators
+### Combinators and Utilities
 
 ```cpp
-// Wait for all tasks
+// Wait for all tasks (waits for every task to settle before propagating errors)
 auto [r1, r2, r3] = co_await QtCoroutine::whenAll(task1, task2, task3);
+
+// Wait for all tasks (short-circuits on first error)
+auto [r1, r2] = co_await QtCoroutine::tryAll(task1, task2);
 
 // Wait for first to complete
 auto winner = co_await QtCoroutine::whenAny(task1, task2);
+
+// Timeout on any QTask
+auto result = co_await QtCoroutine::withTimeout(task, std::chrono::seconds(5));
+
+// Cancellation on any QTask
+auto result = co_await QtCoroutine::cancelledBy(task, stopToken);
 
 // Sleep
 co_await QtCoroutine::sleep(std::chrono::milliseconds(500));
@@ -127,10 +136,10 @@ co_await QtCoroutine::sleep(std::chrono::milliseconds(500));
 
 | Header | Purpose |
 |--------|---------|
-| `qtcoroutine/qtcoroutine.hpp` | Signal awaiting, builder pattern, `sleep()` |
-| `qtcoroutine/qtask.hpp` | `QTask<T>`, `whenAll`, `whenAny` |
-| `qtcoroutine/qfuture_coroutine_traits.hpp` | `QFuture<T>` as coroutine return type + `co_await` |
-| `qtcoroutine/utils.hpp` | Type utilities, `AwaitCancelled` |
+| `QtCoroutine/qtcoroutine.hpp` | Signal awaiting, builder pattern, `sleep()` |
+| `QtCoroutine/qtask.hpp` | `QTask<T>`, `whenAll`, `tryAll`, `whenAny`, `withTimeout`, `cancelledBy` |
+| `QtCoroutine/qfuture_coroutine_traits.hpp` | `QFuture<T>` as coroutine return type + `co_await` |
+| `QtCoroutine/utils.hpp` | Type utilities, `AwaitCancelled` |
 
 ## Cancellation
 
