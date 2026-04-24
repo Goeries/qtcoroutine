@@ -5,6 +5,7 @@
 #include <cassert>
 #include <expected>
 #include <iostream>
+#include <memory>
 #include <stdexcept>
 
 #include <QtCoroutine>
@@ -1584,6 +1585,252 @@ void test_withTimeout_already_complete() {
 }
 
 // ====================================================================
+// 57. .detach() on in-flight task — callback fires after wrapper destructs
+// ====================================================================
+
+QtCoroutine::QTask<int> detachInflight57() {
+    co_return co_await QtConcurrent::run([]() -> int {
+        QThread::msleep(50);
+        return 42;
+    });
+}
+
+void test_detach_inflight(QCoreApplication & app) {
+    std::cout << "test_detach_inflight\n";
+
+    bool callbackFired = false;
+    int capturedValue = 0;
+    {
+        auto task = detachInflight57();
+        task.then([&](const int & val) {
+            callbackFired = true;
+            capturedValue = val;
+        });
+        task.detach();
+        // wrapper destructs here; coroutine runs to completion, callback fires
+    }
+
+    QTimer::singleShot(200, [&]() {
+        TEST_ASSERT(callbackFired, "detached in-flight task callback should fire");
+        TEST_ASSERT(capturedValue == 42, "detached task captured value should be 42");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 58. .detach() on already-completed sync task
+// ====================================================================
+
+void test_detach_already_done() {
+    std::cout << "test_detach_already_done\n";
+
+    bool callbackFired = false;
+    int capturedValue = 0;
+    {
+        auto task = taskReturnsValue();  // returns 42 synchronously, already done
+        task.then([&](const int & val) {
+            callbackFired = true;
+            capturedValue = val;
+        });
+        TEST_ASSERT(callbackFired, ".then() on done task fires immediately");
+        TEST_ASSERT(capturedValue == 42, "captured value should be 42");
+        task.detach();  // destroys already-done frame; wrapper destructor becomes a no-op
+    }
+}
+
+// ====================================================================
+// 59. .detach() without any callbacks — frame self-destructs
+// ====================================================================
+
+QtCoroutine::QTask<void> detachNoCallback59(std::shared_ptr<int> sentinel) {
+    co_await QtConcurrent::run([]() { QThread::msleep(50); });
+}
+
+void test_detach_no_callback(QCoreApplication & app) {
+    std::cout << "test_detach_no_callback\n";
+
+    auto sentinel = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = sentinel;
+    {
+        auto task = detachNoCallback59(sentinel);
+        sentinel.reset();  // caller's ref gone; the frame holds the only ref
+        task.detach();
+        // wrapper destructs; coroutine completes and the frame self-destructs,
+        // releasing the shared_ptr parameter stored in the frame
+    }
+
+    QTimer::singleShot(200, [&]() {
+        TEST_ASSERT(weak.expired(), "sentinel freed => frame destroyed => coroutine self-destructed");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 60. .onCancelled() + .detach() on cancelled task
+// ====================================================================
+
+QtCoroutine::QTask<int> detachCancellable60(Emitter * e, std::stop_token st) {
+    co_return co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
+}
+
+void test_detach_onCancelled(QCoreApplication & app) {
+    std::cout << "test_detach_onCancelled\n";
+
+    Emitter e;
+    std::stop_source ss;
+    bool callbackFired = false;
+    QtCoroutine::utils::AwaitCancelled::Reason receivedReason{};
+    {
+        auto task = detachCancellable60(&e, ss.get_token());
+        task.onCancelled([&](const QtCoroutine::utils::AwaitCancelled & c) {
+            callbackFired = true;
+            receivedReason = c.reason;
+        });
+        task.detach();
+    }
+
+    QTimer::singleShot(10, [&]() { ss.request_stop(); });
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(callbackFired, "onCancelled should fire on detached cancelled task");
+        TEST_ASSERT(receivedReason == QtCoroutine::utils::AwaitCancelled::Stopped,
+                    "reason should be Stopped");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 61. .onError() + .detach() on throwing task
+// ====================================================================
+
+QtCoroutine::QTask<void> detachThrowing61() {
+    co_await QtCoroutine::sleep(std::chrono::milliseconds(10));
+    throw std::runtime_error("detached error");
+}
+
+void test_detach_onError(QCoreApplication & app) {
+    std::cout << "test_detach_onError\n";
+
+    bool callbackFired = false;
+    std::string errorMsg;
+    {
+        auto task = detachThrowing61();
+        task.onError([&](std::exception_ptr ep) {
+            callbackFired = true;
+            try {
+                std::rethrow_exception(ep);
+            } catch (const std::runtime_error & ex) {
+                errorMsg = ex.what();
+            }
+        });
+        task.detach();
+    }
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(callbackFired, "onError should fire on detached throwing task");
+        TEST_ASSERT(errorMsg == "detached error", "error message should match");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 62. Double-detach is a no-op
+// ====================================================================
+
+QtCoroutine::QTask<int> detachTwice62() {
+    co_return co_await QtConcurrent::run([]() -> int {
+        QThread::msleep(50);
+        return 42;
+    });
+}
+
+void test_detach_double(QCoreApplication & app) {
+    std::cout << "test_detach_double\n";
+
+    int callCount = 0;
+    {
+        auto task = detachTwice62();
+        task.then([&](const int &) { ++callCount; });
+        task.detach();
+        task.detach();  // second detach should be a no-op — no crash
+    }
+
+    QTimer::singleShot(200, [&]() {
+        TEST_ASSERT(callCount == 1, "callback should fire exactly once after double detach");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 63. Non-detached destruction still cancels (regression guard)
+// ====================================================================
+
+QtCoroutine::QTask<int> detachRegression63(std::shared_ptr<int> sentinel) {
+    co_await QtConcurrent::run([]() { QThread::msleep(50); });
+    co_return 42;
+}
+
+void test_detach_regression_nondetached(QCoreApplication & app) {
+    std::cout << "test_detach_regression_nondetached\n";
+
+    auto sentinel = std::make_shared<int>(42);
+    std::weak_ptr<int> weak = sentinel;
+    bool callbackFired = false;
+    {
+        auto task = detachRegression63(sentinel);
+        sentinel.reset();  // caller's ref gone
+        task.then([&](const int &) { callbackFired = true; });
+        // DO NOT detach — wrapper destructs, destroying the frame synchronously
+    }
+
+    QTimer::singleShot(200, [&]() {
+        TEST_ASSERT(weak.expired(), "frame destroyed by wrapper => sentinel freed");
+        TEST_ASSERT(!callbackFired, "callback must NOT fire (frame died before return_value)");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 64. co_await on a QTask still works (regression guard for non-detach path)
+// ====================================================================
+
+QtCoroutine::QTask<int> innerTask64() {
+    co_return co_await QtConcurrent::run([]() -> int {
+        QThread::msleep(50);
+        return 42;
+    });
+}
+
+QtCoroutine::QTask<int> outerTask64() {
+    co_return co_await innerTask64();
+}
+
+void test_detach_regression_coawait(QCoreApplication & app) {
+    std::cout << "test_detach_regression_coawait\n";
+
+    auto task = outerTask64();
+
+    QTimer::singleShot(200, [&]() {
+        TEST_ASSERT(task.await_ready(), "outer task should be done");
+        TEST_ASSERT(task.await_resume() == 42, "outer task should return 42");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
 // main
 // ====================================================================
 
@@ -1605,6 +1852,7 @@ int main(int argc, char *argv[])
     test_whenAny_immediate();
     test_qtask_expected_void();
     test_withTimeout_already_complete();
+    test_detach_already_done();
 
     // Async tests (need event loop)
     test_signal_void(app);
@@ -1651,6 +1899,13 @@ int main(int argc, char *argv[])
     test_withTimeout_qfuture_expired(app);
     test_withTimeout_qfuture_in_future(app);
     test_cancelledBy_qfuture_success(app);
+    test_detach_inflight(app);
+    test_detach_no_callback(app);
+    test_detach_onCancelled(app);
+    test_detach_onError(app);
+    test_detach_double(app);
+    test_detach_regression_nondetached(app);
+    test_detach_regression_coawait(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;

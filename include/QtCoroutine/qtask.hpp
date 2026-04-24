@@ -18,6 +18,25 @@
 
 namespace QtCoroutine {
 
+// QTask<T> owns the coroutine frame — the destructor destroys it.
+// Callbacks registered via .then()/.onCancelled()/.onError() fire from
+// inside the coroutine (in return_value / unhandled_exception), so the
+// frame must survive until completion. A common footgun:
+//
+//     someAsyncOp().then(cb);   // cb never fires — wrapper dies at ';'
+//
+// Two lifetime models avoid this:
+//  1. co_await the task — the caller's coroutine frame keeps this one
+//     alive across the suspension; no detach needed.
+//  2. Fire-and-forget — register callbacks, then call .detach() to hand
+//     ownership to the coroutine itself. The frame self-destructs after
+//     final_suspend. Mirrors std::jthread::detach() semantics.
+//
+//         auto task = someAsyncOp();
+//         task.then(cb);
+//         task.detach();
+//
+// .detach() is not thread-safe (single-owner semantics).
 template<typename T>
 class QTask {
 
@@ -42,10 +61,14 @@ public:
 
         // Symmetric transfer: resumes the parent coroutine (if any) when
         // this coroutine completes, avoiding stack overflow in deep chains.
+        // If `detached` was set and nobody is awaiting us, await_ready
+        // returns true so the coroutine proceeds past final_suspend and
+        // the frame is destroyed by the coroutine ABI (self-destruct).
         auto final_suspend() noexcept {
 
             struct Awaiter {
-                bool await_ready() noexcept { return false; }
+                bool selfDestruct;
+                bool await_ready() noexcept { return selfDestruct; }
                 std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
                     auto& p = h.promise();
@@ -55,7 +78,7 @@ public:
                 void await_resume() noexcept {}
             };
 
-            return Awaiter{};
+            return Awaiter{detached && !continuation};
         }
 
         // NOTE: QTask<T> only provides return_value(), not return_void().
@@ -107,6 +130,7 @@ public:
         std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
         std::function<void(std::exception_ptr)> errorCallback;
         std::coroutine_handle<> continuation;
+        bool detached = false;
     };
 
     explicit QTask(std::coroutine_handle<promise_type> handle)
@@ -131,6 +155,21 @@ public:
             m_handle = std::exchange(other.m_handle, nullptr);
         }
         return *this;
+    }
+
+    // See class doc for the fire-and-forget lifetime pattern.
+    void detach() {
+        if (!m_handle) return;
+        if (m_handle.done()) {
+            // Coroutine ran synchronously to completion and is now
+            // suspended at final_suspend with selfDestruct=false (detached
+            // was still false when the Awaiter was constructed). Setting
+            // detached now is too late — destroy the frame manually.
+            m_handle.destroy();
+        } else {
+            m_handle.promise().detached = true;
+        }
+        m_handle = {};
     }
 
 
@@ -251,10 +290,13 @@ public:
             return {};
         }
 
+        // See the QTask<T> specialization above for the semantics of
+        // `selfDestruct` / `detached`.
         auto final_suspend() noexcept {
 
             struct Awaiter {
-                bool await_ready() noexcept { return false; }
+                bool selfDestruct;
+                bool await_ready() noexcept { return selfDestruct; }
                 std::coroutine_handle<> await_suspend(
                     std::coroutine_handle<promise_type> h) noexcept {
                     auto& p = h.promise();
@@ -264,7 +306,7 @@ public:
                 void await_resume() noexcept {}
             };
 
-            return Awaiter{};
+            return Awaiter{detached && !continuation};
         }
 
         void return_void() noexcept {
@@ -299,6 +341,7 @@ public:
         std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
         std::function<void(std::exception_ptr)> errorCallback;
         std::coroutine_handle<> continuation;
+        bool detached = false;
     };
 
     explicit QTask(std::coroutine_handle<promise_type> handle)
@@ -321,6 +364,17 @@ public:
             m_handle = std::exchange(other.m_handle, nullptr);
         }
         return *this;
+    }
+
+    // See class doc (QTask<T> above) for the fire-and-forget pattern.
+    void detach() {
+        if (!m_handle) return;
+        if (m_handle.done()) {
+            m_handle.destroy();
+        } else {
+            m_handle.promise().detached = true;
+        }
+        m_handle = {};
     }
 
     bool await_ready() const noexcept {
