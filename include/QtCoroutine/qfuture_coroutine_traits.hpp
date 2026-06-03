@@ -105,8 +105,25 @@ template<typename T>
             m_guard = std::make_shared<std::atomic<bool>>(false);
             auto guard = m_guard;
             m_future.then(context.get(), [handle, context, guard](auto && ...) {
-                if (guard->exchange(true, std::memory_order_acq_rel)) return;
-                handle.resume();
+                // Defer the resume to a fresh event-loop turn instead of
+                // resuming synchronously here. A synchronous resume drives the
+                // coroutine straight into its next co_await, which re-enters
+                // QFutureInterfaceBase::setContinuation from *inside* this
+                // continuation's delivery — the thread then blocks on a lock it
+                // already holds further up its own stack (self-deadlock). Posting
+                // the resume runs it after this delivery has unwound.
+                //
+                // The guard check must run at resume time (inside the posted
+                // lambda), not here: if the coroutine frame is destroyed during
+                // the post->deliver gap (cancellation/timeout), the destructor
+                // sets the guard and this gate drops the stale resume. Capturing
+                // context in the posted lambda keeps the QObject alive until the
+                // queued call is delivered (Qt drops queued calls whose context
+                // has been destroyed).
+                QMetaObject::invokeMethod(context.get(), [handle, context, guard]() mutable {
+                    if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                    handle.resume();
+                }, Qt::QueuedConnection);
             });
 
             // Note on QFuture cancellation:

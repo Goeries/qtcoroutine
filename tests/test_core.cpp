@@ -2,11 +2,17 @@
 #include <QTimer>
 #include <QThread>
 #include <QtConcurrent>
+#include <atomic>
 #include <cassert>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <expected>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <thread>
+#include <vector>
 
 #include <QtCoroutine>
 
@@ -292,6 +298,86 @@ void test_qfuture_await(QCoreApplication & app) {
     });
 
     app.exec();
+}
+
+// ====================================================================
+// 10b. QFuture chained/concurrent await — self-deadlock regression
+// ====================================================================
+//
+// Regression for: operator co_await(QFuture) self-deadlocks under
+// chained/concurrent awaits.
+//
+// Root cause: the QFuture awaiter resumes the coroutine SYNCHRONOUSLY
+// from inside QFuture::then's continuation, so the coroutine's next
+// co_await re-enters QFutureInterfaceBase::setContinuation while still
+// nested inside the continuation machinery — a thread blocking on a lock
+// it already holds further up its own stack. The synchronous resume
+// fires from either delivery route:
+//   (a) during the event-loop spin, when a continuation posted from a
+//       worker is delivered and drives the next co_await; or
+//   (b) during eager construction, when an awaited future finishes in
+//       the race window between await_ready() and setContinuation(): the
+//       continuation, whose context lives on the current thread, is then
+//       invoked directly (synchronously) instead of being posted.
+// Driving many chains concurrently on one event loop reproduces it.
+//
+// NOTE: the bug freezes the thread itself, so a QTimer watchdog is
+// useless (it is delivered by the same wedged thread). The watchdog runs
+// on a SEPARATE std::thread, armed BEFORE construction (route (b) wedges
+// before app.exec() runs), and force-exits the process so a regression
+// surfaces as a failure instead of hanging forever.
+
+static std::atomic<int> g_chainsDone{0};
+
+QFuture<int> chainedFutures(int depth) {
+    int sum = 0;
+    for (int i = 0; i < depth; ++i)
+        sum += co_await QtConcurrent::run([]() { return 1; });
+    co_return sum;
+}
+
+void test_qfuture_chained_concurrent(QCoreApplication & app) {
+    std::cout << "test_qfuture_chained_concurrent\n";
+
+    constexpr int N = 200;     // concurrent coroutines on one event loop
+    constexpr int DEPTH = 12;  // chained co_await QFuture per coroutine
+
+    g_chainsDone.store(0, std::memory_order_relaxed);
+
+    // Arm the watchdog FIRST: the deadlock can strike during construction
+    // (route (b) above), before the event loop ever runs.
+    std::atomic<bool> finished{false};
+    std::thread watchdog([&finished]() {
+        for (int i = 0; i < 300; ++i) {  // ~30s ceiling
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (finished.load(std::memory_order_acquire))
+                return;
+        }
+        std::fputs("  FAIL: chained QFuture coroutines deadlocked "
+                   "(thread wedged)\n", stderr);
+        std::fflush(stderr);
+        std::_Exit(1);
+    });
+
+    std::vector<QFuture<int>> running;
+    running.reserve(N);
+    for (int k = 0; k < N; ++k) {
+        QFuture<int> f = chainedFutures(DEPTH);
+        // Count completions on the event-loop thread; quit once all finish.
+        f.then(&app, [&app](int v) {
+            TEST_ASSERT(v == DEPTH, "each chain sums to DEPTH");
+            if (g_chainsDone.fetch_add(1, std::memory_order_acq_rel) + 1 == N)
+                app.quit();
+        });
+        running.push_back(std::move(f));
+    }
+
+    app.exec();
+    finished.store(true, std::memory_order_release);
+    watchdog.join();
+
+    TEST_ASSERT(g_chainsDone.load() == N,
+                "all chained QFuture coroutines completed (no deadlock)");
 }
 
 // ====================================================================
@@ -1862,6 +1948,7 @@ int main(int argc, char *argv[])
     test_resume_on(app);
     test_sender_destroyed(app);
     test_qfuture_await(app);
+    test_qfuture_chained_concurrent(app);
     test_qtask_cancellation_state(app);
     test_readyIf_one_arg(app);
     test_qfuture_void(app);
