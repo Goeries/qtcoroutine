@@ -40,12 +40,7 @@ namespace QtCoroutine {
 template<typename T>
 class QTask {
 
-    enum class State {
-        empty,
-        value,
-        cancelled,
-        error
-    };
+    enum class State { empty, value, cancelled, error };
 
 public:
     struct promise_type {
@@ -68,12 +63,12 @@ public:
 
             struct Awaiter {
                 bool selfDestruct;
-                bool await_ready() noexcept { return selfDestruct; }
-                std::coroutine_handle<> await_suspend(
-                    std::coroutine_handle<promise_type> h) noexcept {
-                    auto& p = h.promise();
-                    return p.continuation ? p.continuation
-                                          : std::noop_coroutine();
+                bool await_ready() noexcept {
+                    return selfDestruct;
+                }
+                std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+                    auto & p = h.promise();
+                    return p.continuation ? p.continuation : std::noop_coroutine();
                 }
                 void await_resume() noexcept {}
             };
@@ -90,7 +85,9 @@ public:
             result.emplace(val);
             state = State::value;
             if (thenCallback) {
-                try { thenCallback(*result); } catch (...) {}
+                try {
+                    thenCallback(*result);
+                } catch (...) {}
             }
         }
 
@@ -98,7 +95,9 @@ public:
             result.emplace(std::move(val));
             state = State::value;
             if (thenCallback) {
-                try { thenCallback(*result); } catch (...) {}
+                try {
+                    thenCallback(*result);
+                } catch (...) {}
             }
         }
 
@@ -110,14 +109,18 @@ public:
                 cancelReason = c.reason;
                 state = State::cancelled;
                 if (cancelledCallback) {
-                    try { cancelledCallback(c); } catch (...) {}
+                    try {
+                        cancelledCallback(c);
+                    } catch (...) {}
                 }
             } catch (...) {
                 // Real errors propagate normally
                 exception = std::current_exception();
                 state = State::error;
                 if (errorCallback) {
-                    try { errorCallback(exception); } catch (...) {}
+                    try {
+                        errorCallback(exception);
+                    } catch (...) {}
                 }
             }
         }
@@ -126,7 +129,7 @@ public:
         std::exception_ptr exception;
         QtCoroutine::utils::AwaitCancelled::Reason cancelReason{};
         State state = State::empty;
-        std::function<void(const T&)> thenCallback;
+        std::function<void(const T &)> thenCallback;
         std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
         std::function<void(std::exception_ptr)> errorCallback;
         std::coroutine_handle<> continuation;
@@ -134,19 +137,17 @@ public:
     };
 
     explicit QTask(std::coroutine_handle<promise_type> handle)
-        : m_handle(handle)
-    {}
+        : m_handle(handle) {}
 
     ~QTask() {
         if (m_handle)
             m_handle.destroy();
     }
 
-    QTask(const QTask & ) = delete;
+    QTask(const QTask &) = delete;
 
     QTask(QTask && other) noexcept
-        : m_handle(std::exchange(other.m_handle, nullptr))
-    {}
+        : m_handle(std::exchange(other.m_handle, nullptr)) {}
 
     QTask & operator=(QTask && other) noexcept {
         if (this != &other) {
@@ -159,7 +160,8 @@ public:
 
     // See class doc for the fire-and-forget lifetime pattern.
     void detach() {
-        if (!m_handle) return;
+        if (!m_handle)
+            return;
         if (m_handle.done()) {
             // Coroutine ran synchronously to completion and is now
             // suspended at final_suspend with selfDestruct=false (detached
@@ -171,7 +173,6 @@ public:
         }
         m_handle = {};
     }
-
 
     bool await_ready() const noexcept {
         return m_handle.done();
@@ -195,8 +196,8 @@ public:
     }
 
     template<typename F>
-    void then(F&& callback) {
-        auto& p = m_handle.promise();
+    void then(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::value)
                 callback(*p.result);
@@ -206,8 +207,8 @@ public:
     }
 
     template<typename F>
-    void onCancelled(F&& callback) {
-        auto& p = m_handle.promise();
+    void onCancelled(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::cancelled)
                 callback(QtCoroutine::utils::AwaitCancelled{p.cancelReason});
@@ -217,8 +218,8 @@ public:
     }
 
     template<typename F>
-    void onError(F&& callback) {
-        auto& p = m_handle.promise();
+    void onError(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::error)
                 callback(p.exception);
@@ -271,19 +272,14 @@ private:
 };
 
 // QTask<void> specialization
-template <>
+template<>
 class QTask<void> {
-    enum class State {
-        empty,
-        value,
-        cancelled,
-        error
-    };
+    enum class State { empty, value, cancelled, error };
 
 public:
     struct promise_type {
         QTask get_return_object() {
-            return QTask { std::coroutine_handle<promise_type>::from_promise(*this) };
+            return QTask{std::coroutine_handle<promise_type>::from_promise(*this)};
         }
 
         std::suspend_never initial_suspend() noexcept {
@@ -296,12 +292,12 @@ public:
 
             struct Awaiter {
                 bool selfDestruct;
-                bool await_ready() noexcept { return selfDestruct; }
-                std::coroutine_handle<> await_suspend(
-                    std::coroutine_handle<promise_type> h) noexcept {
-                    auto& p = h.promise();
-                    return p.continuation ? p.continuation
-                                          : std::noop_coroutine();
+                bool await_ready() noexcept {
+                    return selfDestruct;
+                }
+                std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
+                    auto & p = h.promise();
+                    return p.continuation ? p.continuation : std::noop_coroutine();
                 }
                 void await_resume() noexcept {}
             };
@@ -312,7 +308,9 @@ public:
         void return_void() noexcept {
             state = State::value;
             if (thenCallback) {
-                try { thenCallback(); } catch (...) {}
+                try {
+                    thenCallback();
+                } catch (...) {}
             }
         }
 
@@ -323,13 +321,17 @@ public:
                 cancelReason = c.reason;
                 state = State::cancelled;
                 if (cancelledCallback) {
-                    try { cancelledCallback(c); } catch (...) {}
+                    try {
+                        cancelledCallback(c);
+                    } catch (...) {}
                 }
             } catch (...) {
                 exception = std::current_exception();
                 state = State::error;
                 if (errorCallback) {
-                    try { errorCallback(exception); } catch (...) {}
+                    try {
+                        errorCallback(exception);
+                    } catch (...) {}
                 }
             }
         }
@@ -345,8 +347,7 @@ public:
     };
 
     explicit QTask(std::coroutine_handle<promise_type> handle)
-        : m_handle(handle)
-    {}
+        : m_handle(handle) {}
 
     ~QTask() {
         if (m_handle)
@@ -354,8 +355,7 @@ public:
     }
 
     QTask(QTask && other) noexcept
-        : m_handle(std::exchange(other.m_handle, nullptr))
-    {}
+        : m_handle(std::exchange(other.m_handle, nullptr)) {}
 
     QTask & operator=(QTask && other) noexcept {
         if (this != &other) {
@@ -368,7 +368,8 @@ public:
 
     // See class doc (QTask<T> above) for the fire-and-forget pattern.
     void detach() {
-        if (!m_handle) return;
+        if (!m_handle)
+            return;
         if (m_handle.done()) {
             m_handle.destroy();
         } else {
@@ -408,8 +409,8 @@ public:
     }
 
     template<typename F>
-    void then(F&& callback) {
-        auto& p = m_handle.promise();
+    void then(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::value)
                 callback();
@@ -419,8 +420,8 @@ public:
     }
 
     template<typename F>
-    void onCancelled(F&& callback) {
-        auto& p = m_handle.promise();
+    void onCancelled(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::cancelled)
                 callback(QtCoroutine::utils::AwaitCancelled{p.cancelReason});
@@ -430,8 +431,8 @@ public:
     }
 
     template<typename F>
-    void onError(F&& callback) {
-        auto& p = m_handle.promise();
+    void onError(F && callback) {
+        auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::error)
                 callback(p.exception);
@@ -444,9 +445,7 @@ public:
         auto qpromise = std::make_shared<QPromise<void>>();
         qpromise->start();
 
-        then([qpromise]() {
-            qpromise->finish();
-        });
+        then([qpromise]() { qpromise->finish(); });
 
         onCancelled([qpromise](const QtCoroutine::utils::AwaitCancelled & c) {
             qpromise->setException(std::make_exception_ptr(c));
@@ -480,12 +479,10 @@ namespace detail {
 
 template<typename... Ts>
 struct WhenAllAwaitable {
-    std::tuple<QTask<Ts>*...> tasks;
+    std::tuple<QTask<Ts> *...> tasks;
 
     bool await_ready() {
-        return std::apply([](auto*... ptrs) {
-            return (ptrs->await_ready() && ...);
-        }, tasks);
+        return std::apply([](auto *... ptrs) { return (ptrs->await_ready() && ...); }, tasks);
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
@@ -497,7 +494,7 @@ struct WhenAllAwaitable {
         // Otherwise, set its continuation so final_suspend resumes us —
         // this avoids destroying a running coroutine (the callback fires
         // from return_value, before final_suspend).
-        auto setupTask = [remaining, handle](auto* task) {
+        auto setupTask = [remaining, handle](auto * task) {
             auto onComplete = [remaining, handle, task]() {
                 if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     if (task->await_ready())
@@ -506,37 +503,34 @@ struct WhenAllAwaitable {
                         task->await_suspend(handle);
                 }
             };
-            task->then([onComplete](const auto&) { onComplete(); });
-            task->onCancelled([onComplete](const auto&) { onComplete(); });
+            task->then([onComplete](const auto &) { onComplete(); });
+            task->onCancelled([onComplete](const auto &) { onComplete(); });
             task->onError([onComplete](auto) { onComplete(); });
         };
 
-        std::apply([&setupTask](auto*... ptrs) {
-            (setupTask(ptrs), ...);
-        }, tasks);
+        std::apply([&setupTask](auto *... ptrs) { (setupTask(ptrs), ...); }, tasks);
     }
 
     std::tuple<Ts...> await_resume() {
-        return std::apply([](auto*... ptrs) {
-            return std::tuple<Ts...>{ ptrs->await_resume()... };
-        }, tasks);
+        return std::apply([](auto *... ptrs) { return std::tuple<Ts...>{ptrs->await_resume()...}; }, tasks);
     }
 };
 
 template<std::size_t N>
 struct WhenAllVoidAwaitable {
-    std::array<QTask<void>*, N> tasks;
+    std::array<QTask<void> *, N> tasks;
 
     bool await_ready() {
-        for (auto* t : tasks)
-            if (!t->await_ready()) return false;
+        for (auto * t : tasks)
+            if (!t->await_ready())
+                return false;
         return true;
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
         auto remaining = std::make_shared<std::atomic<std::size_t>>(N);
 
-        for (auto* task : tasks) {
+        for (auto * task : tasks) {
             auto onComplete = [remaining, handle, task]() {
                 if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     if (task->await_ready())
@@ -546,29 +540,29 @@ struct WhenAllVoidAwaitable {
                 }
             };
             task->then([onComplete]() { onComplete(); });
-            task->onCancelled([onComplete](const auto&) { onComplete(); });
+            task->onCancelled([onComplete](const auto &) { onComplete(); });
             task->onError([onComplete](auto) { onComplete(); });
         }
     }
 
     void await_resume() {
-        for (auto* t : tasks)
+        for (auto * t : tasks)
             t->await_resume();
     }
 };
 
-}  // namespace detail
+} // namespace detail
 
 template<typename... Ts>
-    requires (sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
+    requires(sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
 auto whenAll(QTask<Ts> &... tasks) {
-    return detail::WhenAllAwaitable<Ts...>{ std::tuple{&tasks...} };
+    return detail::WhenAllAwaitable<Ts...>{std::tuple{&tasks...}};
 }
 
 template<std::same_as<QTask<void>>... Tasks>
-    requires (sizeof...(Tasks) > 0)
+    requires(sizeof...(Tasks) > 0)
 auto whenAll(Tasks &... tasks) {
-    return detail::WhenAllVoidAwaitable<sizeof...(Tasks)>{ {&tasks...} };
+    return detail::WhenAllVoidAwaitable<sizeof...(Tasks)>{{&tasks...}};
 }
 
 // ------------------------------------------------------------------
@@ -578,13 +572,13 @@ auto whenAll(Tasks &... tasks) {
 // ------------------------------------------------------------------
 
 template<typename... Ts>
-    requires (sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
+    requires(sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
 QTask<std::tuple<Ts...>> tryAll(QTask<Ts> &... tasks) {
-    co_return std::tuple{ (co_await tasks)... };
+    co_return std::tuple{(co_await tasks)...};
 }
 
 template<std::same_as<QTask<void>>... Tasks>
-    requires (sizeof...(Tasks) > 0)
+    requires(sizeof...(Tasks) > 0)
 QTask<void> tryAll(Tasks &... tasks) {
     ((co_await tasks), ...);
 }
@@ -599,7 +593,7 @@ namespace detail {
 
 template<typename T, std::size_t N>
 struct WhenAnyAwaitable {
-    std::array<QTask<T>*, N> tasks;
+    std::array<QTask<T> *, N> tasks;
     std::size_t readyIndex = 0;
 
     bool await_ready() {
@@ -616,7 +610,8 @@ struct WhenAnyAwaitable {
         auto guard = std::make_shared<std::atomic<bool>>(false);
         for (std::size_t i = 0; i < N; ++i) {
             auto resume = [this, i, handle, guard]() {
-                if (guard->exchange(true, std::memory_order_acq_rel)) return;
+                if (guard->exchange(true, std::memory_order_acq_rel))
+                    return;
                 readyIndex = i;
                 if (tasks[i]->await_ready())
                     handle.resume();
@@ -636,12 +631,12 @@ struct WhenAnyAwaitable {
     }
 };
 
-}  // namespace detail
+} // namespace detail
 
 template<typename T, typename... Rest>
-    requires (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
+    requires(std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
 auto whenAny(QTask<T> & first, Rest &... rest) {
-    return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{ {&first, &rest...} };
+    return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{{&first, &rest...}};
 }
 
 // ------------------------------------------------------------------
@@ -665,10 +660,12 @@ struct CancelledByAwaitable {
     std::unique_ptr<QObject> context;
 
     CancelledByAwaitable(QTask<T> & t, std::stop_token tok)
-        : task(t), token(std::move(tok)) {}
+        : task(t),
+          token(std::move(tok)) {}
 
     ~CancelledByAwaitable() {
-        if (guard) guard->store(true, std::memory_order_release);
+        if (guard)
+            guard->store(true, std::memory_order_release);
         stopCb.reset();
     }
 
@@ -684,8 +681,7 @@ struct CancelledByAwaitable {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
-        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
-                   "co_await cancelledBy",
+        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "co_await cancelledBy",
                    "co_await requires a running event loop on this thread");
 
         guard = std::make_shared<std::atomic<bool>>(false);
@@ -695,13 +691,17 @@ struct CancelledByAwaitable {
         auto ctx = context.get();
 
         auto resume = [this, handle, g, ctx](bool isCancelled) {
-            if (g->load(std::memory_order_acquire)) return;
-            QMetaObject::invokeMethod(ctx,
+            if (g->load(std::memory_order_acquire))
+                return;
+            QMetaObject::invokeMethod(
+                ctx,
                 [this, handle, g, isCancelled]() mutable {
-                    if (g->exchange(true, std::memory_order_acq_rel)) return;
+                    if (g->exchange(true, std::memory_order_acq_rel))
+                        return;
                     cancelled = isCancelled;
                     handle.resume();
-                }, Qt::QueuedConnection);
+                },
+                Qt::QueuedConnection);
         };
 
         if constexpr (std::is_void_v<T>) {
@@ -713,8 +713,7 @@ struct CancelledByAwaitable {
         task.onError([resume](auto) { resume(false); });
 
         if (token.stop_possible()) {
-            stopCb = std::make_unique<StopCallback>(
-                token, [resume]() { resume(true); });
+            stopCb = std::make_unique<StopCallback>(token, [resume]() { resume(true); });
         }
     }
 
@@ -726,7 +725,7 @@ struct CancelledByAwaitable {
     }
 };
 
-}  // namespace detail
+} // namespace detail
 
 template<typename T>
 QTask<T> cancelledBy(QTask<T> & task, std::stop_token token) {
@@ -755,11 +754,14 @@ struct TaskTimeoutAwaitable {
     std::unique_ptr<QObject> context;
 
     TaskTimeoutAwaitable(QTask<T> & t, std::chrono::milliseconds m)
-        : task(t), ms(m) {}
+        : task(t),
+          ms(m) {}
 
     ~TaskTimeoutAwaitable() {
-        if (timer) timer->stop();
-        if (guard) guard->store(true, std::memory_order_release);
+        if (timer)
+            timer->stop();
+        if (guard)
+            guard->store(true, std::memory_order_release);
     }
 
     TaskTimeoutAwaitable(TaskTimeoutAwaitable &&) = default;
@@ -770,8 +772,7 @@ struct TaskTimeoutAwaitable {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
-        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
-                   "co_await withTimeout",
+        Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "co_await withTimeout",
                    "co_await requires a running event loop on this thread");
 
         guard = std::make_shared<std::atomic<bool>>(false);
@@ -781,12 +782,16 @@ struct TaskTimeoutAwaitable {
         auto ctx = context.get();
 
         auto resume = [handle, g, ctx]() {
-            if (g->load(std::memory_order_acquire)) return;
-            QMetaObject::invokeMethod(ctx,
+            if (g->load(std::memory_order_acquire))
+                return;
+            QMetaObject::invokeMethod(
+                ctx,
                 [handle, g]() mutable {
-                    if (g->exchange(true, std::memory_order_acq_rel)) return;
+                    if (g->exchange(true, std::memory_order_acq_rel))
+                        return;
                     handle.resume();
-                }, Qt::QueuedConnection);
+                },
+                Qt::QueuedConnection);
         };
 
         if constexpr (std::is_void_v<T>) {
@@ -799,12 +804,15 @@ struct TaskTimeoutAwaitable {
 
         timer = std::make_unique<QTimer>();
         timer->setSingleShot(true);
-        QObject::connect(timer.get(), &QTimer::timeout, ctx,
-                         [this, handle, g]() {
-                             if (g->exchange(true, std::memory_order_acq_rel)) return;
-                             timedOut = true;
-                             handle.resume();
-                         }, Qt::QueuedConnection);
+        QObject::connect(
+            timer.get(), &QTimer::timeout, ctx,
+            [this, handle, g]() {
+                if (g->exchange(true, std::memory_order_acq_rel))
+                    return;
+                timedOut = true;
+                handle.resume();
+            },
+            Qt::QueuedConnection);
         timer->start(static_cast<int>(ms.count()));
     }
 
@@ -815,7 +823,7 @@ struct TaskTimeoutAwaitable {
     }
 };
 
-}  // namespace detail
+} // namespace detail
 
 template<typename T>
 QTask<T> withTimeout(QTask<T> & task, std::chrono::milliseconds ms) {
@@ -826,4 +834,4 @@ inline QTask<void> withTimeout(QTask<void> & task, std::chrono::milliseconds ms)
     co_await detail::TaskTimeoutAwaitable<void>(task, ms);
 }
 
-}  // namespace QtCoroutine
+} // namespace QtCoroutine

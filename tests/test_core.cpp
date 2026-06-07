@@ -21,14 +21,14 @@
 static int g_passed = 0;
 static int g_failed = 0;
 
-#define TEST_ASSERT(expr, msg) \
-    do { \
-        if (!(expr)) { \
-            std::cerr << "  FAIL: " << msg << " (" << #expr << ")\n"; \
-            ++g_failed; \
-        } else { \
-            ++g_passed; \
-        } \
+#define TEST_ASSERT(expr, msg)                                                                                         \
+    do {                                                                                                               \
+        if (!(expr)) {                                                                                                 \
+            std::cerr << "  FAIL: " << msg << " (" << #expr << ")\n";                                                  \
+            ++g_failed;                                                                                                \
+        } else {                                                                                                       \
+            ++g_passed;                                                                                                \
+        }                                                                                                              \
     } while (0)
 
 // ---- Emitter used by signal tests ----
@@ -200,8 +200,7 @@ void test_signal_two_args(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitWithCancel(Emitter * e, std::stop_token st) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .cancelledBy(st);
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).cancelledBy(st);
 }
 
 void test_cancellation(QCoreApplication & app) {
@@ -215,8 +214,7 @@ void test_cancellation(QCoreApplication & app) {
     QTimer::singleShot(50, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after cancel");
         TEST_ASSERT(task.isCancelled(), "should report cancelled");
-        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped,
-                    "reason should be Stopped");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "reason should be Stopped");
         app.quit();
     });
 
@@ -228,8 +226,7 @@ void test_cancellation(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitWithResumeCtx(Emitter * e, QObject * ctx) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .resumeOn(ctx);
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).resumeOn(ctx);
     co_return val;
 }
 
@@ -237,7 +234,7 @@ void test_resume_on(QCoreApplication & app) {
     std::cout << "test_resume_on\n";
 
     Emitter e;
-    QObject ctx;  // resume context
+    QObject ctx; // resume context
     auto task = awaitWithResumeCtx(&e, &ctx);
 
     QTimer::singleShot(10, [&]() { emit e.oneArg(77); });
@@ -339,8 +336,8 @@ QFuture<int> chainedFutures(int depth) {
 void test_qfuture_chained_concurrent(QCoreApplication & app) {
     std::cout << "test_qfuture_chained_concurrent\n";
 
-    constexpr int N = 200;     // concurrent coroutines on one event loop
-    constexpr int DEPTH = 12;  // chained co_await QFuture per coroutine
+    constexpr int N = 200;    // concurrent coroutines on one event loop
+    constexpr int DEPTH = 12; // chained co_await QFuture per coroutine
 
     g_chainsDone.store(0, std::memory_order_relaxed);
 
@@ -348,13 +345,14 @@ void test_qfuture_chained_concurrent(QCoreApplication & app) {
     // (route (b) above), before the event loop ever runs.
     std::atomic<bool> finished{false};
     std::thread watchdog([&finished]() {
-        for (int i = 0; i < 300; ++i) {  // ~30s ceiling
+        for (int i = 0; i < 300; ++i) { // ~30s ceiling
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             if (finished.load(std::memory_order_acquire))
                 return;
         }
         std::fputs("  FAIL: chained QFuture coroutines deadlocked "
-                   "(thread wedged)\n", stderr);
+                   "(thread wedged)\n",
+                   stderr);
         std::fflush(stderr);
         std::_Exit(1);
     });
@@ -376,8 +374,7 @@ void test_qfuture_chained_concurrent(QCoreApplication & app) {
     finished.store(true, std::memory_order_release);
     watchdog.join();
 
-    TEST_ASSERT(g_chainsDone.load() == N,
-                "all chained QFuture coroutines completed (no deadlock)");
+    TEST_ASSERT(g_chainsDone.load() == N, "all chained QFuture coroutines completed (no deadlock)");
 }
 
 // ====================================================================
@@ -385,8 +382,7 @@ void test_qfuture_chained_concurrent(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitOneArgWithCancel(Emitter * e, std::stop_token st) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .cancelledBy(st);
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
     co_return val;
 }
 
@@ -412,8 +408,7 @@ void test_qtask_cancellation_state(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitWithReadyCheckVoid(Emitter * e) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .readyIf([](Emitter *) { return true; });  // already ready
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).readyIf([](Emitter *) { return true; }); // already ready
 }
 
 void test_readyIf_void() {
@@ -429,11 +424,11 @@ void test_readyIf_void() {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitWithReadyCheckOneArg(Emitter * e, bool ready) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .readyIf([ready](Emitter *) -> std::optional<int> {
-            if (ready) return 999;
-            return std::nullopt;
-        });
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).readyIf([ready](Emitter *) -> std::optional<int> {
+        if (ready)
+            return 999;
+        return std::nullopt;
+    });
     co_return val;
 }
 
@@ -471,9 +466,9 @@ void test_readyIf_one_arg(QCoreApplication & app) {
 
 QtCoroutine::QTask<std::pair<bool, QString>> awaitWithReadyCheckTwoArgs(Emitter * e) {
     auto [ok, msg] = co_await QtCoroutine::signal(e, &Emitter::twoArgs)
-        .readyIf([](Emitter *) -> std::optional<std::tuple<bool, QString>> {
-            return std::tuple{true, QString("cached")};
-        });
+                         .readyIf([](Emitter *) -> std::optional<std::tuple<bool, QString>> {
+                             return std::tuple{true, QString("cached")};
+                         });
     co_return std::pair{ok, msg};
 }
 
@@ -494,12 +489,12 @@ void test_readyIf_two_args() {
 
 QtCoroutine::QTask<int> taskThatThrows() {
     throw std::runtime_error("test error");
-    co_return 0;  // never reached
+    co_return 0; // never reached
 }
 
 QtCoroutine::QTask<int> taskChainWithException() {
     auto val = co_await taskThatThrows();
-    co_return val;  // never reached
+    co_return val; // never reached
 }
 
 void test_exception_propagation() {
@@ -569,8 +564,7 @@ void test_sleep(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitWithTimeoutSuccess(Emitter * e) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .withTimeout(std::chrono::milliseconds(500));
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).withTimeout(std::chrono::milliseconds(500));
     co_return val;
 }
 
@@ -596,8 +590,7 @@ void test_withTimeout_success(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitWithTimeoutExpired(Emitter * e) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .withTimeout(std::chrono::milliseconds(20));
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).withTimeout(std::chrono::milliseconds(20));
 }
 
 void test_withTimeout_expired(QCoreApplication & app) {
@@ -609,8 +602,7 @@ void test_withTimeout_expired(QCoreApplication & app) {
     QTimer::singleShot(100, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after timeout");
         TEST_ASSERT(task.isCancelled(), "should report cancelled");
-        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout,
-                    "reason should be Timeout");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "reason should be Timeout");
         app.quit();
     });
 
@@ -635,8 +627,7 @@ void test_qtask_void_move_assignment() {
 // ====================================================================
 
 QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>> awaitAsExpectedSuccess(Emitter * e) {
-    auto result = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .asExpected();
+    auto result = co_await QtCoroutine::signal(e, &Emitter::oneArg).asExpected();
     co_return result;
 }
 
@@ -662,10 +653,9 @@ void test_asExpected_success(QCoreApplication & app) {
 // 22. asExpected — cancellation (returns unexpected)
 // ====================================================================
 
-QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>> awaitAsExpectedCancelled(Emitter * e, std::stop_token st) {
-    auto result = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .cancelledBy(st)
-        .asExpected();
+QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>>
+awaitAsExpectedCancelled(Emitter * e, std::stop_token st) {
+    auto result = co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st).asExpected();
     co_return result;
 }
 
@@ -693,8 +683,7 @@ void test_asExpected_cancelled(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<std::expected<void, QtCoroutine::utils::AwaitCancelled>> awaitAsExpectedVoid(Emitter * e) {
-    auto result = co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .asExpected();
+    auto result = co_await QtCoroutine::signal(e, &Emitter::voidSignal).asExpected();
     co_return result;
 }
 
@@ -720,8 +709,7 @@ void test_asExpected_void(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitOneArgCancellable24(Emitter * e, std::stop_token st) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .cancelledBy(st);
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
     co_return val;
 }
 
@@ -755,8 +743,7 @@ void test_onCancelled_fires(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitOneArgCancellable25(Emitter * e, std::stop_token st) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .cancelledBy(st);
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
     co_return val;
 }
 
@@ -816,8 +803,7 @@ void test_onError_fires() {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitVoidCancellable27(Emitter * e, std::stop_token st) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .cancelledBy(st);
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).cancelledBy(st);
 }
 
 void test_onCancelled_void_task(QCoreApplication & app) {
@@ -873,8 +859,7 @@ void test_toFuture_success(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<int> awaitOneArgCancellable29(Emitter * e, std::stop_token st) {
-    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg)
-        .cancelledBy(st);
+    auto val = co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
     co_return val;
 }
 
@@ -932,8 +917,8 @@ void test_toFuture_void(QCoreApplication & app) {
 void test_whenAll_sync() {
     std::cout << "test_whenAll_sync\n";
 
-    auto t1 = taskReturnsValue();  // 42
-    auto t2 = taskReturns42();     // 42
+    auto t1 = taskReturnsValue(); // 42
+    auto t2 = taskReturns42();    // 42
     auto combined = QtCoroutine::whenAll(t1, t2);
     TEST_ASSERT(combined.await_ready(), "whenAll of sync tasks should be ready");
     auto [r1, r2] = combined.await_resume();
@@ -1033,8 +1018,8 @@ void test_whenAny_first_wins(QCoreApplication & app) {
 void test_whenAny_immediate() {
     std::cout << "test_whenAny_immediate\n";
 
-    auto t1 = taskReturnsValue();  // already done, 42
-    auto t2 = taskReturns42();     // already done, 42
+    auto t1 = taskReturnsValue(); // already done, 42
+    auto t2 = taskReturns42();    // already done, 42
     auto awaitable = QtCoroutine::whenAny(t1, t2);
     TEST_ASSERT(awaitable.await_ready(), "whenAny should be immediately ready");
     TEST_ASSERT(awaitable.await_resume() == 42, "result should be 42");
@@ -1075,8 +1060,7 @@ void test_qtask_destroyed_while_suspended(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitWithResumeCtx37(Emitter * e, QObject * ctx) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .resumeOn(ctx);
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).resumeOn(ctx);
 }
 
 void test_resume_context_destroyed(QCoreApplication & app) {
@@ -1106,9 +1090,9 @@ void test_signal_before_coawait(QCoreApplication & app) {
     std::cout << "test_signal_before_coawait\n";
 
     Emitter e;
-    emit e.oneArg(99);  // Emitted BEFORE task is created
+    emit e.oneArg(99); // Emitted BEFORE task is created
 
-    auto task = awaitOneArg(&e);  // Uses existing helper
+    auto task = awaitOneArg(&e); // Uses existing helper
     TEST_ASSERT(!task.await_ready(), "should NOT capture pre-emission signal");
 
     QTimer::singleShot(10, [&]() { emit e.oneArg(42); });
@@ -1155,7 +1139,7 @@ QtCoroutine::QTask<int> awaitOneArgCancellable40(Emitter * e, std::stop_token st
 
 QtCoroutine::QTask<std::tuple<int, int>> whenAllOneCancelled(Emitter * e1, Emitter * e2, std::stop_token st) {
     auto t1 = awaitOneArgCancellable40(e1, st);
-    auto t2 = awaitOneArg32b(e2);  // Reuse existing helper
+    auto t2 = awaitOneArg32b(e2); // Reuse existing helper
     co_return co_await QtCoroutine::whenAll(t1, t2);
 }
 
@@ -1207,9 +1191,7 @@ void test_toFuture_exception(QCoreApplication & app) {
 // ====================================================================
 
 QtCoroutine::QTask<void> awaitWithTimeoutAndCancel(Emitter * e, std::stop_token st) {
-    co_await QtCoroutine::signal(e, &Emitter::voidSignal)
-        .withTimeout(std::chrono::milliseconds(500))
-        .cancelledBy(st);
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).withTimeout(std::chrono::milliseconds(500)).cancelledBy(st);
 }
 
 void test_timeout_and_cancel_together(QCoreApplication & app) {
@@ -1235,10 +1217,12 @@ void test_timeout_and_cancel_together(QCoreApplication & app) {
 // 38. QTask<std::expected<void, E>> — co_return {} for void expected
 // ====================================================================
 
-struct TestError { int code; };
+struct TestError {
+    int code;
+};
 
 QtCoroutine::QTask<std::expected<void, TestError>> taskExpectedVoidSuccess() {
-    co_return {};  // default-constructs expected (success) — co_return; would NOT compile
+    co_return {}; // default-constructs expected (success) — co_return; would NOT compile
 }
 
 QtCoroutine::QTask<std::expected<void, TestError>> taskExpectedVoidError() {
@@ -1307,8 +1291,7 @@ void test_cancelledBy_stopped(QCoreApplication & app) {
     QTimer::singleShot(50, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after stop");
         TEST_ASSERT(task.isCancelled(), "should report cancelled");
-        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped,
-                    "reason should be Stopped");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "reason should be Stopped");
         app.quit();
     });
 
@@ -1319,8 +1302,8 @@ void test_cancelledBy_stopped(QCoreApplication & app) {
 // 48. cancelledBy + asExpected composition (async)
 // ====================================================================
 
-QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>>
-cancelledByExpected48(Emitter * e, std::stop_token st) {
+QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>> cancelledByExpected48(Emitter * e,
+                                                                                                 std::stop_token st) {
     auto task = awaitOneArg(e);
     auto wrapped = QtCoroutine::cancelledBy(task, st);
     co_return co_await QtCoroutine::ExpectedAwaitable<QtCoroutine::QTask<int>>(std::move(wrapped));
@@ -1372,9 +1355,8 @@ void test_whenAll_one_errors(QCoreApplication & app) {
     QTimer::singleShot(30, [&]() { emit eNormal.oneArg(22); });
 
     // At 20ms, t1 has errored but t2 hasn't completed — task should NOT be done
-    QTimer::singleShot(20, [&]() {
-        TEST_ASSERT(!task.await_ready(), "whenAll should wait for ALL tasks even when one errors");
-    });
+    QTimer::singleShot(
+        20, [&]() { TEST_ASSERT(!task.await_ready(), "whenAll should wait for ALL tasks even when one errors"); });
 
     QTimer::singleShot(100, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after all tasks complete");
@@ -1383,8 +1365,7 @@ void test_whenAll_one_errors(QCoreApplication & app) {
             task.await_resume();
         } catch (const std::runtime_error & ex) {
             caught = true;
-            TEST_ASSERT(std::string(ex.what()) == "whenAll error",
-                        "should propagate error from errored task");
+            TEST_ASSERT(std::string(ex.what()) == "whenAll error", "should propagate error from errored task");
         }
         TEST_ASSERT(caught, "whenAll should propagate error after all complete");
         app.quit();
@@ -1397,8 +1378,7 @@ void test_whenAll_one_errors(QCoreApplication & app) {
 // 44. whenAll — mixed async timing, results in declaration order (async)
 // ====================================================================
 
-QtCoroutine::QTask<std::tuple<int, int, int>> whenAllMixedTiming44(
-        Emitter * e1, Emitter * e2, Emitter * e3) {
+QtCoroutine::QTask<std::tuple<int, int, int>> whenAllMixedTiming44(Emitter * e1, Emitter * e2, Emitter * e3) {
     auto t1 = awaitOneArg32b(e1);
     auto t2 = awaitOneArg32b(e2);
     auto t3 = awaitOneArg32b(e3);
@@ -1453,8 +1433,7 @@ void test_tryAll_short_circuits(QCoreApplication & app) {
             task.await_resume();
         } catch (const std::runtime_error & ex) {
             caught = true;
-            TEST_ASSERT(std::string(ex.what()) == "whenAll error",
-                        "should propagate error from first failing task");
+            TEST_ASSERT(std::string(ex.what()) == "whenAll error", "should propagate error from first failing task");
         }
         TEST_ASSERT(caught, "tryAll should short-circuit on first error");
         app.quit();
@@ -1507,8 +1486,7 @@ void test_withTimeout_qtask_expired(QCoreApplication & app) {
     QTimer::singleShot(100, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after timeout");
         TEST_ASSERT(task.isCancelled(), "should report cancelled");
-        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout,
-                    "reason should be Timeout");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "reason should be Timeout");
         app.quit();
     });
 
@@ -1519,8 +1497,7 @@ void test_withTimeout_qtask_expired(QCoreApplication & app) {
 // 51. withTimeout (QTask) + ExpectedAwaitable composition
 // ====================================================================
 
-QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>>
-withTimeoutExpected51(Emitter * e) {
+QtCoroutine::QTask<std::expected<int, QtCoroutine::utils::AwaitCancelled>> withTimeoutExpected51(Emitter * e) {
     auto inner = awaitOneArg(e);
     auto task = QtCoroutine::withTimeout(inner, std::chrono::milliseconds(20));
     co_return co_await QtCoroutine::ExpectedAwaitable<QtCoroutine::QTask<int>>(std::move(task));
@@ -1598,8 +1575,7 @@ void test_withTimeout_qfuture_expired(QCoreApplication & app) {
     QTimer::singleShot(300, [&]() {
         TEST_ASSERT(task.await_ready(), "should be done after timeout");
         TEST_ASSERT(task.isCancelled(), "should report cancelled");
-        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout,
-                    "reason should be Timeout");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "reason should be Timeout");
         app.quit();
     });
 
@@ -1664,7 +1640,7 @@ void test_cancelledBy_qfuture_success(QCoreApplication & app) {
 void test_withTimeout_already_complete() {
     std::cout << "test_withTimeout_already_complete\n";
 
-    auto inner = taskReturnsValue();  // already done, 42
+    auto inner = taskReturnsValue(); // already done, 42
     auto task = QtCoroutine::withTimeout(inner, std::chrono::milliseconds(5000));
     TEST_ASSERT(task.await_ready(), "already-complete task should be immediately ready");
     TEST_ASSERT(task.await_resume() == 42, "should return 42");
@@ -1715,14 +1691,14 @@ void test_detach_already_done() {
     bool callbackFired = false;
     int capturedValue = 0;
     {
-        auto task = taskReturnsValue();  // returns 42 synchronously, already done
+        auto task = taskReturnsValue(); // returns 42 synchronously, already done
         task.then([&](const int & val) {
             callbackFired = true;
             capturedValue = val;
         });
         TEST_ASSERT(callbackFired, ".then() on done task fires immediately");
         TEST_ASSERT(capturedValue == 42, "captured value should be 42");
-        task.detach();  // destroys already-done frame; wrapper destructor becomes a no-op
+        task.detach(); // destroys already-done frame; wrapper destructor becomes a no-op
     }
 }
 
@@ -1741,7 +1717,7 @@ void test_detach_no_callback(QCoreApplication & app) {
     std::weak_ptr<int> weak = sentinel;
     {
         auto task = detachNoCallback59(sentinel);
-        sentinel.reset();  // caller's ref gone; the frame holds the only ref
+        sentinel.reset(); // caller's ref gone; the frame holds the only ref
         task.detach();
         // wrapper destructs; coroutine completes and the frame self-destructs,
         // releasing the shared_ptr parameter stored in the frame
@@ -1782,8 +1758,7 @@ void test_detach_onCancelled(QCoreApplication & app) {
     QTimer::singleShot(10, [&]() { ss.request_stop(); });
     QTimer::singleShot(100, [&]() {
         TEST_ASSERT(callbackFired, "onCancelled should fire on detached cancelled task");
-        TEST_ASSERT(receivedReason == QtCoroutine::utils::AwaitCancelled::Stopped,
-                    "reason should be Stopped");
+        TEST_ASSERT(receivedReason == QtCoroutine::utils::AwaitCancelled::Stopped, "reason should be Stopped");
         app.quit();
     });
 
@@ -1845,7 +1820,7 @@ void test_detach_double(QCoreApplication & app) {
         auto task = detachTwice62();
         task.then([&](const int &) { ++callCount; });
         task.detach();
-        task.detach();  // second detach should be a no-op — no crash
+        task.detach(); // second detach should be a no-op — no crash
     }
 
     QTimer::singleShot(200, [&]() {
@@ -1873,7 +1848,7 @@ void test_detach_regression_nondetached(QCoreApplication & app) {
     bool callbackFired = false;
     {
         auto task = detachRegression63(sentinel);
-        sentinel.reset();  // caller's ref gone
+        sentinel.reset(); // caller's ref gone
         task.then([&](const int &) { callbackFired = true; });
         // DO NOT detach — wrapper destructs, destroying the frame synchronously
     }
@@ -1920,8 +1895,7 @@ void test_detach_regression_coawait(QCoreApplication & app) {
 // main
 // ====================================================================
 
-int main(int argc, char *argv[])
-{
+int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
     // Synchronous tests (no event loop needed)

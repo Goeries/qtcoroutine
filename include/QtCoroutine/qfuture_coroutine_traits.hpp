@@ -72,7 +72,7 @@ struct coroutine_traits<QFuture<void>, Args...> {
     };
 };
 
-}  // namespace std
+} // namespace std
 
 // operator co_await for QFuture awaitable
 template<typename T>
@@ -80,11 +80,11 @@ template<typename T>
     class Awaitable {
     public:
         Awaitable(QFuture<T> && future)
-            : m_future(std::move(future))
-        {}
+            : m_future(std::move(future)) {}
 
         ~Awaitable() {
-            if (m_guard) m_guard->store(true, std::memory_order_release);
+            if (m_guard)
+                m_guard->store(true, std::memory_order_release);
         }
 
         bool await_ready() const noexcept {
@@ -93,8 +93,7 @@ template<typename T>
 
         // template<typename Promise>
         void await_suspend(std::coroutine_handle</*Promise*/> handle) {
-            Q_ASSERT_X(QThread::currentThread()->eventDispatcher(),
-                       "co_await QFuture",
+            Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "co_await QFuture",
                        "co_await requires a running event loop on this thread");
 
             // Context is shared_ptr so the QFuture's continuation lambda keeps
@@ -104,7 +103,7 @@ template<typename T>
             auto context = std::make_shared<QObject>();
             m_guard = std::make_shared<std::atomic<bool>>(false);
             auto guard = m_guard;
-            m_future.then(context.get(), [handle, context, guard](auto && ...) {
+            m_future.then(context.get(), [handle, context, guard](auto &&...) {
                 // Defer the resume to a fresh event-loop turn instead of
                 // resuming synchronously here. A synchronous resume drives the
                 // coroutine straight into its next co_await, which re-enters
@@ -120,10 +119,14 @@ template<typename T>
                 // context in the posted lambda keeps the QObject alive until the
                 // queued call is delivered (Qt drops queued calls whose context
                 // has been destroyed).
-                QMetaObject::invokeMethod(context.get(), [handle, context, guard]() mutable {
-                    if (guard->exchange(true, std::memory_order_acq_rel)) return;
-                    handle.resume();
-                }, Qt::QueuedConnection);
+                QMetaObject::invokeMethod(
+                    context.get(),
+                    [handle, context, guard]() mutable {
+                        if (guard->exchange(true, std::memory_order_acq_rel))
+                            return;
+                        handle.resume();
+                    },
+                    Qt::QueuedConnection);
             });
 
             // Note on QFuture cancellation:
@@ -156,8 +159,7 @@ template<typename T>
         // We unwrap and rethrow the original exception so callers get natural exception propagation.
         auto await_resume() {
             if (m_future.isCanceled())
-                throw QtCoroutine::utils::AwaitCancelled{
-                    QtCoroutine::utils::AwaitCancelled::Stopped};
+                throw QtCoroutine::utils::AwaitCancelled{QtCoroutine::utils::AwaitCancelled::Stopped};
 
             try {
                 m_future.waitForFinished();
@@ -172,8 +174,7 @@ template<typename T>
                     return m_future.takeResult();
                 else
                     throw std::runtime_error("Awaitable cannot await_resume invalid future");
-            }
-            else
+            } else
                 return;
         }
 
@@ -182,7 +183,5 @@ template<typename T>
         std::shared_ptr<std::atomic<bool>> m_guard;
     };
 
-    return Awaitable {std::move(future)};
+    return Awaitable{std::move(future)};
 }
-
-

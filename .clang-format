@@ -1,0 +1,45 @@
+# QtCoroutine code style.
+# Requires clang-format >= 14.
+---
+Language: Cpp
+BasedOnStyle: LLVM
+Standard: Latest
+
+# Indentation
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+AccessModifierOffset: -4
+NamespaceIndentation: None
+IndentCaseLabels: false
+
+# Line width
+ColumnLimit: 120
+
+# Pointer / reference: middle alignment  ->  const Type & var,  Type * ptr
+DerivePointerAlignment: false
+PointerAlignment: Middle
+ReferenceAlignment: Pointer
+
+# Braces on the same line
+BreakBeforeBraces: Attach
+
+# Space before control-statement parens: if (), for (), while ()  — not foo()
+SpaceBeforeParens: ControlStatements
+
+# Templates:  template<...> on its own line, no space after `template`
+SpaceAfterTemplateKeyword: false
+AlwaysBreakTemplateDeclarations: Yes
+
+# Short constructs: only empty {} bodies stay inline; expand short ifs/loops
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# Constructor initializer list always breaks onto its own line(s)
+PackConstructorInitializers: Never
+BreakConstructorInitializers: BeforeColon
+
+# Don't reorder includes (ordering here is intentional / Qt-first)
+SortIncludes: false

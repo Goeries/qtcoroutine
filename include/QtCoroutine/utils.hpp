@@ -9,7 +9,8 @@
 
 namespace QtCoroutine::utils {
 
-template<typename Signal> struct SignalArgs;
+template<typename Signal>
+struct SignalArgs;
 
 template<typename T, typename... Args>
 struct SignalArgs<void (T::*)(Args...)> {
@@ -36,7 +37,9 @@ struct ReadyCheckResultImpl {
     using type = std::optional<typename SignalArgs<Signal>::tuple_type>;
 };
 template<typename Signal>
-struct ReadyCheckResultImpl<0, Signal> { using type = bool; };
+struct ReadyCheckResultImpl<0, Signal> {
+    using type = bool;
+};
 template<typename Signal>
 struct ReadyCheckResultImpl<1, Signal> {
     using type = std::optional<std::tuple_element_t<0, typename SignalArgs<Signal>::tuple_type>>;
@@ -47,27 +50,28 @@ struct ConnectResultImpl {
     using type = typename SignalArgs<Signal>::tuple_type;
 };
 template<typename Signal>
-struct ConnectResultImpl<0, Signal> { using type = void; };
+struct ConnectResultImpl<0, Signal> {
+    using type = void;
+};
 template<typename Signal>
 struct ConnectResultImpl<1, Signal> {
     using type = std::tuple_element_t<0, typename SignalArgs<Signal>::tuple_type>;
 };
 
-}  // namespace detail
+} // namespace detail
 
-template <typename Signal>
+template<typename Signal>
 using ReadyCheckResultT = typename detail::ReadyCheckResultImpl<SignalArgs<Signal>::count, Signal>::type;
 
-template <typename Signal>
+template<typename Signal>
 using ConnectResultT = typename detail::ConnectResultImpl<SignalArgs<Signal>::count, Signal>::type;
 
 struct AwaitCancelled {
-    enum Reason : uint8_t
-    {
-        Stopped                     =   0b000,  // stop_token triggered
-        SenderDestroyed             =   0b001,  // sender QObject destroyed
-        ResumeContextDestroyed      =   0b010,  // resumeContext QObject destroyed
-        Timeout                     =   0b100   // withTimeout expired
+    enum Reason : uint8_t {
+        Stopped = 0b000,                // stop_token triggered
+        SenderDestroyed = 0b001,        // sender QObject destroyed
+        ResumeContextDestroyed = 0b010, // resumeContext QObject destroyed
+        Timeout = 0b100                 // withTimeout expired
     } reason;
 
     constexpr bool wasStopped() const {
@@ -83,7 +87,7 @@ struct AwaitCancelled {
     }
 
     constexpr std::string_view message() const {
-        switch(reason) {
+        switch (reason) {
         case Stopped:
             return "Stop request received";
         case SenderDestroyed:
@@ -103,4 +107,4 @@ struct AwaitCancelled {
     }
 };
 
-}  // namespace QtCoroutine::utils
+} // namespace QtCoroutine::utils
