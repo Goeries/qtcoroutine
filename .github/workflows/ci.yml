@@ -19,10 +19,25 @@ jobs:
           version: '6.8.*'
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON -DQTCOROUTINE_BUILD_EXAMPLES=ON
 
       - name: Build
         run: cmake --build build
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+      - name: Run example
+        run: ./build/examples/qtcoroutine-example-basic
+
+  format:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install clang-format
+        run: sudo apt-get update && sudo apt-get install -y clang-format
+
+      - name: Check formatting
+        run: clang-format --dry-run --Werror include/QtCoroutine/*.hpp tests/*.cpp examples/*.cpp
