@@ -1706,7 +1706,7 @@ void test_detach_already_done() {
 // 59. .detach() without any callbacks — frame self-destructs
 // ====================================================================
 
-QtCoroutine::QTask<void> detachNoCallback59(std::shared_ptr<int> sentinel) {
+QtCoroutine::QTask<void> detachNoCallback59([[maybe_unused]] std::shared_ptr<int> sentinel) {
     co_await QtConcurrent::run([]() { QThread::msleep(50); });
 }
 
@@ -1835,7 +1835,7 @@ void test_detach_double(QCoreApplication & app) {
 // 63. Non-detached destruction still cancels (regression guard)
 // ====================================================================
 
-QtCoroutine::QTask<int> detachRegression63(std::shared_ptr<int> sentinel) {
+QtCoroutine::QTask<int> detachRegression63([[maybe_unused]] std::shared_ptr<int> sentinel) {
     co_await QtConcurrent::run([]() { QThread::msleep(50); });
     co_return 42;
 }
