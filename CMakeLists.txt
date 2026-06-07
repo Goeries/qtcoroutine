@@ -71,3 +71,10 @@ if(QTCOROUTINE_BUILD_TESTS)
     add_test(NAME core COMMAND qtcoroutine-tests)
     set_tests_properties(core PROPERTIES TIMEOUT 180)
 endif()
+
+# --- Examples (opt-in) ---
+
+option(QTCOROUTINE_BUILD_EXAMPLES "Build examples" OFF)
+if(QTCOROUTINE_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif()
