@@ -224,7 +224,7 @@ target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
 
 ## Requirements
 
-- C++23 (GCC 13+, Clang 16+, MSVC 2022 17.5+)
+- C++23 (GCC 13+, MSVC 2022 17.5+)
 - Qt 6
 - CMake 3.22+
 

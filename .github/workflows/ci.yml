@@ -8,7 +8,24 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux GCC
+            os: ubuntu-24.04
+            qt_arch: linux_gcc_64
+          - name: Windows MSVC
+            os: windows-2022
+            qt_arch: win64_msvc2022_64
+            cmake_extra: -A x64
+          - name: Windows MinGW
+            os: windows-2022
+            qt_arch: win64_mingw
+            qt_tools: tools_mingw1310
+            cmake_extra: -G "MinGW Makefiles"
 
     steps:
       - uses: actions/checkout@v6
@@ -17,18 +34,22 @@ jobs:
         uses: jurplel/install-qt-action@v4
         with:
           version: '6.8.*'
+          arch: ${{ matrix.qt_arch }}
+          tools: ${{ matrix.qt_tools }}
+
+      - name: Add MinGW to PATH
+        if: matrix.qt_tools != ''
+        shell: bash
+        run: echo "$IQTA_TOOLS/mingw1310_64/bin" >> "$GITHUB_PATH"
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON -DQTCOROUTINE_BUILD_EXAMPLES=ON
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON -DQTCOROUTINE_BUILD_EXAMPLES=ON ${{ matrix.cmake_extra }}
 
       - name: Build
-        run: cmake --build build
+        run: cmake --build build --config Debug
 
       - name: Test
-        run: ctest --test-dir build --output-on-failure
-
-      - name: Run example
-        run: ./build/examples/qtcoroutine-example-basic
+        run: ctest --test-dir build -C Debug --output-on-failure
 
   format:
     runs-on: ubuntu-24.04
