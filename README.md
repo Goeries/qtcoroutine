@@ -1,5 +1,10 @@
 # QtCoroutine
 
+[![CI](https://github.com/Goeries/qtcoroutine/actions/workflows/ci.yml/badge.svg)](https://github.com/Goeries/qtcoroutine/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+![C++23](https://img.shields.io/badge/C%2B%2B-23-blue.svg)
+![Qt6](https://img.shields.io/badge/Qt-6-41cd52.svg)
+
 A C++23 coroutine library for Qt 6. Header-only, designed to make asynchronous Qt code read like sequential code.
 
 ```cpp
@@ -8,7 +13,7 @@ A C++23 coroutine library for Qt 6. Header-only, designed to make asynchronous Q
 QtCoroutine::QTask<QByteArray> fetchData(QNetworkAccessManager & nam, QUrl url, std::stop_token st) {
     auto * reply = nam.get(QNetworkRequest{url});
 
-    co_await QtCoroutine::signal(reply, &QNetworkReply::finished)
+    co_await QtCoroutine::connect(reply, &QNetworkReply::finished)
         .cancelledBy(st)
         .withTimeout(std::chrono::seconds(30));
 
@@ -26,16 +31,16 @@ QtCoroutine::QTask<QByteArray> fetchData(QNetworkAccessManager & nam, QUrl url, 
 
 ```cpp
 // Void signal
-co_await QtCoroutine::signal(&button, &QPushButton::clicked);
+co_await QtCoroutine::connect(&button, &QPushButton::clicked);
 
 // Signal with arguments — automatically unwrapped
-auto text = co_await QtCoroutine::signal(&edit, &QLineEdit::textChanged);
+auto text = co_await QtCoroutine::connect(&edit, &QLineEdit::textChanged);
 
 // Structured bindings for multi-arg signals
-auto [id, name] = co_await QtCoroutine::signal(&api, &Api::userCreated);
+auto [id, name] = co_await QtCoroutine::connect(&api, &Api::userCreated);
 
 // Full builder chain
-auto result = co_await QtCoroutine::signal(&obj, &Obj::finished)
+auto result = co_await QtCoroutine::connect(&obj, &Obj::finished)
     .resumeOn(&context)                    // resume on a specific thread
     .cancelledBy(stopToken)                // cancellation via std::stop_token
     .withTimeout(std::chrono::seconds(5))  // timeout support
@@ -84,7 +89,7 @@ QFuture<int> pipeline() {
 Opt into `std::expected` instead of exceptions with `.asExpected()`:
 
 ```cpp
-auto result = co_await QtCoroutine::signal(&obj, &Obj::finished)
+auto result = co_await QtCoroutine::connect(&obj, &Obj::finished)
     .cancelledBy(st)
     .asExpected();
 
@@ -99,7 +104,7 @@ auto value = *result;
 
 ```cpp
 QTask<std::expected<void, QString>> tryConnect(Client & c, std::stop_token st) {
-    auto reply = co_await QtCoroutine::signal(&c, &Client::connected)
+    auto reply = co_await QtCoroutine::connect(&c, &Client::connected)
         .cancelledBy(st)
         .asExpected();
 
@@ -148,8 +153,8 @@ The library uses `std::stop_token` for cancellation, which propagates automatica
 ```cpp
 QtCoroutine::QTask<void> work(std::stop_token st) {
     // AwaitCancelled propagates automatically if st is cancelled
-    co_await QtCoroutine::signal(&obj, &Obj::step1Done).cancelledBy(st);
-    co_await QtCoroutine::signal(&obj, &Obj::step2Done).cancelledBy(st);
+    co_await QtCoroutine::connect(&obj, &Obj::step1Done).cancelledBy(st);
+    co_await QtCoroutine::connect(&obj, &Obj::step2Done).cancelledBy(st);
 }
 
 auto task = work(stopSource.get_token());
@@ -162,12 +167,36 @@ if (task.isCancelled())
 
 ## Integration
 
-### FetchContent (recommended)
+### Git submodule (recommended)
+
+Add the library under `external/` so its version is pinned in your repository:
+
+```bash
+git submodule add https://github.com/Goeries/qtcoroutine.git external/qtcoroutine
+git -C external/qtcoroutine checkout v0.1.0-alpha   # optional: pin to a release
+```
+
+Then add it from your `CMakeLists.txt`:
+
+```cmake
+add_subdirectory(external/qtcoroutine)
+target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
+```
+
+Anyone cloning your project pulls the library along with it:
+
+```bash
+git clone --recurse-submodules <your-repo>
+# or, in an existing clone:
+git submodule update --init --recursive
+```
+
+### FetchContent
 
 ```cmake
 include(FetchContent)
 FetchContent_Declare(qtcoroutine
-    GIT_REPOSITORY https://github.com/goeries/qtcoroutine.git
+    GIT_REPOSITORY https://github.com/Goeries/qtcoroutine.git
     GIT_TAG v0.1.0-alpha
 )
 FetchContent_MakeAvailable(qtcoroutine)
@@ -199,9 +228,9 @@ target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
 - Qt 6
 - CMake 3.22+
 
-## Naming: `signal()` vs `connect()`
+## Naming: `connect()` vs `signal()`
 
-Both `QtCoroutine::signal()` and `QtCoroutine::connect()` are identical. Prefer `signal()` — it avoids name collisions with `QtFuture::connect` when both namespaces are imported via `using namespace`.
+`QtCoroutine::connect()` and `QtCoroutine::signal()` are the exact same function. The examples use `connect()` because it mirrors `QObject::connect` and `QtFuture::connect`. If that name ever clashes in your code — for example with `QObject::connect` or `QtFuture::connect` brought in unqualified via `using namespace` — use `signal()` instead; it's identical, just collision-free.
 
 ## Tested On
 
@@ -209,3 +238,7 @@ Both `QtCoroutine::signal()` and `QtCoroutine::connect()` are identical. Prefer 
 |----------|----------|
 | GCC 13.3 | Ubuntu 24.04 (WSL2) |
 | MinGW GCC | Windows 11 |
+
+## License
+
+[MIT](LICENSE) © 2026 Jeandré Gouws
