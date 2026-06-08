@@ -29,6 +29,9 @@ qrc_*.cpp
 # Claude Code
 CLAUDE.md
 
+# Internal design notes (local briefs, not for publication)
+.internal/
+
 # OS
 .DS_Store
 Thumbs.db
