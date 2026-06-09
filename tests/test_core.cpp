@@ -2077,6 +2077,32 @@ void test_stop_then_destroy_before_resume(QCoreApplication & app) {
     TEST_ASSERT(true, "no use-after-free resuming after stop+destroy");
 }
 
+// ====================================================================
+// 69. Task destroyed while suspended in sleep() (regression: the timer
+//     callback captured the raw handle with no guard and resumed a
+//     destroyed frame — UAF under ASan)
+// ====================================================================
+
+QtCoroutine::QTask<void> sleepingTask(bool * reached) {
+    co_await QtCoroutine::sleep(std::chrono::milliseconds(40));
+    *reached = true;
+}
+
+void test_sleep_destroyed_while_suspended(QCoreApplication & app) {
+    std::cout << "test_sleep_destroyed_while_suspended\n";
+
+    bool reached = false;
+    {
+        auto task = sleepingTask(&reached);
+        TEST_ASSERT(!task.await_ready(), "should be sleeping");
+    } // frame destroyed mid-sleep; the single-shot timer is still pending
+
+    // Let the stale timer fire — it must be dropped.
+    QTimer::singleShot(100, [&]() { app.quit(); });
+    app.exec();
+    TEST_ASSERT(!reached, "destroyed sleeper must not run past the sleep");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2155,6 +2181,7 @@ int main(int argc, char * argv[]) {
     test_qfuture_exception_from_worker(app);
     test_qfuture_cancel_while_suspended(app);
     test_stop_then_destroy_before_resume(app);
+    test_sleep_destroyed_while_suspended(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;

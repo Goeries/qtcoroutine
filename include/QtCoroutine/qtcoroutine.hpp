@@ -339,6 +339,15 @@ auto connect(Sender * sender, Signal sig) {
 inline auto sleep(std::chrono::milliseconds ms) {
     struct SleepAwaitable {
         std::chrono::milliseconds duration;
+        std::shared_ptr<std::atomic<bool>> guard;
+
+        // If the coroutine frame is destroyed mid-sleep (task goes out of
+        // scope), mark the pending timer callback stale so it doesn't
+        // resume freed memory.
+        ~SleepAwaitable() {
+            if (guard)
+                guard->store(true, std::memory_order_release);
+        }
 
         bool await_ready() const noexcept {
             return duration <= std::chrono::milliseconds::zero();
@@ -347,7 +356,11 @@ inline auto sleep(std::chrono::milliseconds ms) {
         void await_suspend(std::coroutine_handle<> handle) {
             Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "co_await sleep",
                        "co_await requires a running event loop on this thread");
-            QTimer::singleShot(duration, [handle]() mutable { handle.resume(); });
+            guard = std::make_shared<std::atomic<bool>>(false);
+            QTimer::singleShot(duration, [handle, g = guard]() mutable {
+                if (!g->exchange(true, std::memory_order_acq_rel))
+                    handle.resume();
+            });
         }
 
         void await_resume() const noexcept {}
