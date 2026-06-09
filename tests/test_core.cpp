@@ -1927,6 +1927,130 @@ void test_precancelled_stop_token() {
     TEST_ASSERT(t2.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "1-arg reason is Stopped");
 }
 
+// ====================================================================
+// 66. co_await QFuture: exception delivered while suspended (regression:
+//     Qt skips value-signature then-continuations on exception, so the
+//     coroutine never resumed; also exception futures report isCanceled()
+//     and were misreported as AwaitCancelled on the ready path)
+// ====================================================================
+
+QtCoroutine::QTask<int> awaitIntFuture(QFuture<int> f) {
+    co_return co_await f;
+}
+
+void test_qfuture_exception_while_suspended(QCoreApplication & app) {
+    std::cout << "test_qfuture_exception_while_suspended\n";
+
+    QPromise<int> promise;
+    promise.start();
+    auto task = awaitIntFuture(promise.future());
+    TEST_ASSERT(!task.await_ready(), "should be suspended on unfinished future");
+
+    QTimer::singleShot(10, [&]() {
+        promise.setException(std::make_exception_ptr(std::runtime_error("future failed")));
+        promise.finish();
+    });
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "should resume after future exception");
+        if (task.await_ready()) {
+            TEST_ASSERT(!task.isCancelled(), "exception is an error, not a cancellation");
+            bool caught = false;
+            try {
+                task.await_resume();
+            } catch (std::runtime_error & e) {
+                caught = std::string(e.what()) == "future failed";
+            } catch (...) {}
+            TEST_ASSERT(caught, "original exception propagates through co_await");
+        }
+        app.quit();
+    });
+
+    app.exec();
+}
+
+QtCoroutine::QTask<int> awaitConcurrentThrow() {
+    auto f = QtConcurrent::run([]() -> int {
+        QThread::msleep(30);
+        throw std::runtime_error("worker threw");
+    });
+    co_return co_await f;
+}
+
+void test_qfuture_exception_from_worker(QCoreApplication & app) {
+    std::cout << "test_qfuture_exception_from_worker\n";
+
+    auto task = awaitConcurrentThrow();
+
+    QTimer::singleShot(300, [&]() {
+        TEST_ASSERT(task.await_ready(), "should resume after worker exception");
+        if (task.await_ready()) {
+            TEST_ASSERT(!task.isCancelled(), "worker exception is an error, not a cancellation");
+            bool caught = false;
+            try {
+                task.await_resume();
+            } catch (std::runtime_error & e) {
+                caught = std::string(e.what()) == "worker threw";
+            } catch (...) {}
+            TEST_ASSERT(caught, "QUnhandledException is unwrapped to the original exception");
+        }
+        app.quit();
+    });
+
+    app.exec();
+}
+
+void test_qfuture_already_failed() {
+    std::cout << "test_qfuture_already_failed\n";
+
+    QPromise<int> promise;
+    promise.start();
+    promise.setException(std::make_exception_ptr(std::runtime_error("already failed")));
+    promise.finish();
+
+    auto task = awaitIntFuture(promise.future());
+    TEST_ASSERT(task.await_ready(), "already-failed future settles immediately");
+    TEST_ASSERT(!task.isCancelled(), "stored exception beats the isCanceled() check");
+    bool caught = false;
+    try {
+        task.await_resume();
+    } catch (std::runtime_error & e) {
+        caught = std::string(e.what()) == "already failed";
+    } catch (...) {}
+    TEST_ASSERT(caught, "exception propagates on the ready path");
+}
+
+// ====================================================================
+// 67. co_await QFuture: canceled while suspended (regression: then-
+//     continuations never run on cancellation, so the coroutine hung)
+// ====================================================================
+
+void test_qfuture_cancel_while_suspended(QCoreApplication & app) {
+    std::cout << "test_qfuture_cancel_while_suspended\n";
+
+    QPromise<int> promise;
+    promise.start();
+    auto task = awaitIntFuture(promise.future());
+    TEST_ASSERT(!task.await_ready(), "should be suspended on unfinished future");
+
+    // cancel() alone does not run continuations on Qt 6.4 — the resume
+    // happens once the canceled future settles (finish, or QPromise
+    // destruction, or the canceled worker completing).
+    QTimer::singleShot(10, [&]() {
+        promise.future().cancel();
+        promise.finish();
+    });
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(task.await_ready(), "should resume after future cancel");
+        if (task.await_ready()) {
+            TEST_ASSERT(task.isCancelled(), "cancel maps to cancelled state");
+            TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "reason should be Stopped");
+        }
+        app.quit();
+    });
+
+    app.exec();
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -1946,6 +2070,7 @@ int main(int argc, char * argv[]) {
     test_withTimeout_already_complete();
     test_detach_already_done();
     test_precancelled_stop_token();
+    test_qfuture_already_failed();
 
     // Async tests (need event loop)
     test_signal_void(app);
@@ -2000,6 +2125,9 @@ int main(int argc, char * argv[]) {
     test_detach_double(app);
     test_detach_regression_nondetached(app);
     test_detach_regression_coawait(app);
+    test_qfuture_exception_while_suspended(app);
+    test_qfuture_exception_from_worker(app);
+    test_qfuture_cancel_while_suspended(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
