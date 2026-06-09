@@ -124,8 +124,12 @@ public:
     // ---- Awaitable interface ----
 
     bool await_ready() {
-        if (m_stop.stop_requested())
+        if (m_stop.stop_requested()) {
+            // Mark cancelled here: await_suspend never runs on the ready
+            // path, so the stop-callback that normally sets this is skipped.
+            m_cancelled = true;
             return true;
+        }
 
         if constexpr (!std::is_same_v<ReadyCheck, std::nullptr_t>) {
             auto checkResult = std::invoke(m_ready, m_sender);

@@ -1895,6 +1895,38 @@ void test_detach_regression_coawait(QCoreApplication & app) {
 // main
 // ====================================================================
 
+// ====================================================================
+// 65. Pre-requested stop_token cancels at co_await (regression: used to
+//     take the success path — silent success for 0-arg signals, empty-
+//     optional dereference (UB) for N-arg signals)
+// ====================================================================
+
+QtCoroutine::QTask<void> awaitPreStoppedVoid(Emitter * e, std::stop_token st) {
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).cancelledBy(st);
+}
+
+QtCoroutine::QTask<int> awaitPreStoppedOneArg(Emitter * e, std::stop_token st) {
+    co_return co_await QtCoroutine::signal(e, &Emitter::oneArg).cancelledBy(st);
+}
+
+void test_precancelled_stop_token() {
+    std::cout << "test_precancelled_stop_token\n";
+
+    Emitter e;
+    std::stop_source ss;
+    ss.request_stop();
+
+    auto t1 = awaitPreStoppedVoid(&e, ss.get_token());
+    TEST_ASSERT(t1.await_ready(), "pre-stopped 0-arg await settles immediately");
+    TEST_ASSERT(t1.isCancelled(), "pre-stopped 0-arg await is cancelled");
+    TEST_ASSERT(t1.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "0-arg reason is Stopped");
+
+    auto t2 = awaitPreStoppedOneArg(&e, ss.get_token());
+    TEST_ASSERT(t2.await_ready(), "pre-stopped 1-arg await settles immediately");
+    TEST_ASSERT(t2.isCancelled(), "pre-stopped 1-arg await is cancelled");
+    TEST_ASSERT(t2.cancelReason() == QtCoroutine::utils::AwaitCancelled::Stopped, "1-arg reason is Stopped");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -1913,6 +1945,7 @@ int main(int argc, char * argv[]) {
     test_qtask_expected_void();
     test_withTimeout_already_complete();
     test_detach_already_done();
+    test_precancelled_stop_token();
 
     // Async tests (need event loop)
     test_signal_void(app);
