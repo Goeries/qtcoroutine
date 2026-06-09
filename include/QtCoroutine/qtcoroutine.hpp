@@ -118,7 +118,7 @@ public:
         requires std::invocable<std::decay_t<F>, Sender *> &&
                  std::convertible_to<std::invoke_result_t<std::decay_t<F>, Sender *>, utils::ReadyCheckResultT<Signal>>
     QSignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
-        return {m_sender, m_signal, m_resumeCtx, std::move(m_stop), std::forward<F>(check)};
+        return {m_sender, m_signal, m_resumeCtx, std::move(m_stop), m_timeout, std::forward<F>(check)};
     }
 
     // ---- Awaitable interface ----
@@ -267,12 +267,17 @@ private:
         requires std::derived_from<S, QObject>
     friend class QSignalAwaitable;
 
-    QSignalAwaitable(Sender * sender, Signal signal, QObject * resumeCtx, std::stop_token stop, ReadyCheck ready)
+    // Forwards ALL builder state: readyIf() rebuilds the awaitable with a
+    // different ReadyCheck type, so anything configured before it must be
+    // carried over here or it is silently lost.
+    QSignalAwaitable(Sender * sender, Signal signal, QObject * resumeCtx, std::stop_token stop,
+                     std::optional<std::chrono::milliseconds> timeout, ReadyCheck ready)
         : m_sender(sender),
           m_signal(signal),
           m_resumeCtx(resumeCtx),
           m_stop(std::move(stop)),
-          m_ready(std::move(ready)) {}
+          m_ready(std::move(ready)),
+          m_timeout(timeout) {}
 
     void cleanup() {
         // Mark any in-flight resume as stale. The stop-token path posts its

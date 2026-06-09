@@ -2103,6 +2103,50 @@ void test_sleep_destroyed_while_suspended(QCoreApplication & app) {
     TEST_ASSERT(!reached, "destroyed sleeper must not run past the sleep");
 }
 
+// ====================================================================
+// 70. Builder order: withTimeout() before readyIf() (regression: the
+//     readyIf() rebuild dropped m_timeout, so the timeout never armed
+//     and the await could suspend forever)
+// ====================================================================
+
+QtCoroutine::QTask<int> awaitTimeoutThenReadyIf(Emitter * e) {
+    co_return co_await QtCoroutine::signal(e, &Emitter::oneArg)
+        .withTimeout(std::chrono::milliseconds(20))
+        .readyIf([](Emitter *) { return std::optional<int>{}; });
+}
+
+QtCoroutine::QTask<int> awaitReadyIfThenTimeout(Emitter * e) {
+    co_return co_await QtCoroutine::signal(e, &Emitter::oneArg)
+        .readyIf([](Emitter *) { return std::optional<int>{}; })
+        .withTimeout(std::chrono::milliseconds(20));
+}
+
+void test_withTimeout_readyIf_order(QCoreApplication & app) {
+    std::cout << "test_withTimeout_readyIf_order\n";
+
+    Emitter e;
+    auto t1 = awaitTimeoutThenReadyIf(&e);
+    auto t2 = awaitReadyIfThenTimeout(&e);
+    TEST_ASSERT(!t1.await_ready(), "t1 suspends: check not ready, no signal yet");
+    TEST_ASSERT(!t2.await_ready(), "t2 suspends: check not ready, no signal yet");
+
+    QTimer::singleShot(100, [&]() {
+        TEST_ASSERT(t1.await_ready(), "withTimeout().readyIf() must keep the timeout");
+        if (t1.await_ready()) {
+            TEST_ASSERT(t1.isCancelled(), "t1 should be cancelled");
+            TEST_ASSERT(t1.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "t1 reason is Timeout");
+        }
+        TEST_ASSERT(t2.await_ready(), "readyIf().withTimeout() times out");
+        if (t2.await_ready()) {
+            TEST_ASSERT(t2.isCancelled(), "t2 should be cancelled");
+            TEST_ASSERT(t2.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "t2 reason is Timeout");
+        }
+        app.quit();
+    });
+
+    app.exec();
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2182,6 +2226,7 @@ int main(int argc, char * argv[]) {
     test_qfuture_cancel_while_suspended(app);
     test_stop_then_destroy_before_resume(app);
     test_sleep_destroyed_while_suspended(app);
+    test_withTimeout_readyIf_order(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
