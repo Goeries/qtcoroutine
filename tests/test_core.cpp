@@ -2051,6 +2051,32 @@ void test_qfuture_cancel_while_suspended(QCoreApplication & app) {
     app.exec();
 }
 
+// ====================================================================
+// 68. Task destroyed between request_stop() and the event-loop spin
+//     (regression: the stop callback posts a queued resume; the guard
+//     was a local of await_suspend, so destroying the frame could not
+//     mark it stale and the posted call resumed freed memory — UAF
+//     under ASan)
+// ====================================================================
+
+void test_stop_then_destroy_before_resume(QCoreApplication & app) {
+    std::cout << "test_stop_then_destroy_before_resume\n";
+
+    Emitter e;
+    std::stop_source ss;
+    {
+        auto task = awaitWithCancel(&e, ss.get_token());
+        TEST_ASSERT(!task.await_ready(), "should be suspended");
+        ss.request_stop(); // posts the queued resume
+    } // task (and coroutine frame) destroyed before the loop spins
+
+    // Deliver the stale queued resume — it must be dropped, not fire
+    // into the destroyed frame.
+    QTimer::singleShot(50, [&]() { app.quit(); });
+    app.exec();
+    TEST_ASSERT(true, "no use-after-free resuming after stop+destroy");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2128,6 +2154,7 @@ int main(int argc, char * argv[]) {
     test_qfuture_exception_while_suspended(app);
     test_qfuture_exception_from_worker(app);
     test_qfuture_cancel_while_suspended(app);
+    test_stop_then_destroy_before_resume(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;

@@ -157,7 +157,10 @@ public:
 
         // Guard: multiple callbacks could fire near-simultaneously across
         // threads. Atomic exchange ensures exactly one calls handle.resume().
-        auto guard = std::make_shared<std::atomic<bool>>(false);
+        // Stored as a member so cleanup()/the destructor can mark in-flight
+        // resumes stale — see cleanup().
+        m_guard = std::make_shared<std::atomic<bool>>(false);
+        auto guard = m_guard;
 
         // If signal fires, resume coroutine
         m_signalConnection = QObject::connect(m_sender, m_signal, ctx, [this, handle, guard](auto &&... args) mutable {
@@ -272,6 +275,13 @@ private:
           m_ready(std::move(ready)) {}
 
     void cleanup() {
+        // Mark any in-flight resume as stale. The stop-token path posts its
+        // resume via QMetaObject::invokeMethod (QueuedConnection); unlike the
+        // connections below, a posted call cannot be disconnected and would
+        // fire into freed memory if the coroutine frame is destroyed between
+        // request_stop() and delivery.
+        if (m_guard)
+            m_guard->store(true, std::memory_order_release);
         QObject::disconnect(m_signalConnection);
         QObject::disconnect(m_senderDestroyedConnection);
         QObject::disconnect(m_resumeContextDestroyedConnection);
@@ -293,6 +303,7 @@ private:
     std::unique_ptr<StopCallback> m_stopCallback;
     std::optional<std::chrono::milliseconds> m_timeout;
     std::unique_ptr<QTimer> m_timeoutTimer;
+    std::shared_ptr<std::atomic<bool>> m_guard;
     bool m_cancelled = false;
     bool m_timedOut = false;
     bool m_senderDestroyed = false;
