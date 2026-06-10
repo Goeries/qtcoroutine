@@ -1,0 +1,2 @@
+# Normalize to LF in the repository; editors/IDEs on any platform handle LF.
+* text=auto eol=lf
