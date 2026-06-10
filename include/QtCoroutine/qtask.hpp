@@ -713,7 +713,9 @@ struct CancelledByAwaitable {
     bool cancelled = false;
     std::shared_ptr<std::atomic<bool>> guard;
     std::unique_ptr<StopCallback> stopCb;
-    std::unique_ptr<QObject> context;
+    // shared_ptr: callbacks capture it by value so a completion racing this
+    // awaitable's destruction never posts to a freed context object.
+    std::shared_ptr<QObject> context;
 
     CancelledByAwaitable(QTask<T> & t, std::stop_token tok)
         : task(t),
@@ -741,17 +743,17 @@ struct CancelledByAwaitable {
                    "co_await requires a running event loop on this thread");
 
         guard = std::make_shared<std::atomic<bool>>(false);
-        context = std::make_unique<QObject>();
+        context = std::make_shared<QObject>();
 
         auto g = guard;
-        auto ctx = context.get();
+        auto ctx = context;
 
         auto resume = [this, handle, g, ctx](bool isCancelled) {
             if (g->load(std::memory_order_acquire))
                 return;
             QMetaObject::invokeMethod(
-                ctx,
-                [this, handle, g, isCancelled]() mutable {
+                ctx.get(),
+                [this, handle, g, ctx, isCancelled]() mutable {
                     if (g->exchange(true, std::memory_order_acq_rel))
                         return;
                     cancelled = isCancelled;
@@ -807,7 +809,8 @@ struct TaskTimeoutAwaitable {
     bool timedOut = false;
     std::unique_ptr<QTimer> timer;
     std::shared_ptr<std::atomic<bool>> guard;
-    std::unique_ptr<QObject> context;
+    // See CancelledByAwaitable::context for why this is a shared_ptr.
+    std::shared_ptr<QObject> context;
 
     TaskTimeoutAwaitable(QTask<T> & t, std::chrono::milliseconds m)
         : task(t),
@@ -832,17 +835,17 @@ struct TaskTimeoutAwaitable {
                    "co_await requires a running event loop on this thread");
 
         guard = std::make_shared<std::atomic<bool>>(false);
-        context = std::make_unique<QObject>();
+        context = std::make_shared<QObject>();
 
         auto g = guard;
-        auto ctx = context.get();
+        auto ctx = context;
 
         auto resume = [handle, g, ctx]() {
             if (g->load(std::memory_order_acquire))
                 return;
             QMetaObject::invokeMethod(
-                ctx,
-                [handle, g]() mutable {
+                ctx.get(),
+                [handle, g, ctx]() mutable {
                     if (g->exchange(true, std::memory_order_acq_rel))
                         return;
                     handle.resume();
@@ -861,7 +864,7 @@ struct TaskTimeoutAwaitable {
         timer = std::make_unique<QTimer>();
         timer->setSingleShot(true);
         QObject::connect(
-            timer.get(), &QTimer::timeout, ctx,
+            timer.get(), &QTimer::timeout, ctx.get(),
             [this, handle, g]() {
                 if (g->exchange(true, std::memory_order_acq_rel))
                     return;
@@ -869,7 +872,7 @@ struct TaskTimeoutAwaitable {
                 handle.resume();
             },
             Qt::QueuedConnection);
-        timer->start(static_cast<int>(ms.count()));
+        timer->start(ms);
     }
 
     auto await_resume() -> decltype(task.await_resume()) {
