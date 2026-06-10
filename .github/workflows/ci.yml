@@ -51,6 +51,44 @@ jobs:
       - name: Test
         run: ctest --test-dir build -C Debug --output-on-failure
 
+  sanitize:
+    name: Linux ${{ matrix.sanitizer }} sanitizer
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sanitizer: address
+            cxx_flags: -fsanitize=address -fno-omit-frame-pointer
+          - sanitizer: thread
+            cxx_flags: -fsanitize=thread -fno-omit-frame-pointer
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.*'
+          arch: linux_gcc_64
+
+      # Recent kernels randomize mmap with more entropy than libtsan's
+      # shadow-memory layout tolerates.
+      - name: Lower ASLR entropy for TSan
+        if: matrix.sanitizer == 'thread'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Debug -DQTCOROUTINE_BUILD_TESTS=ON -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}"
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        env:
+          TSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/tsan.supp
+        run: ctest --test-dir build --output-on-failure
+
   format:
     runs-on: ubuntu-24.04
 

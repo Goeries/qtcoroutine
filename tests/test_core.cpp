@@ -2268,15 +2268,16 @@ void test_cross_thread_sender_resumes_on_awaiting_thread(QCoreApplication & app)
     std::cout << "test_cross_thread_sender_resumes_on_awaiting_thread\n";
 
     QThread worker;
-    worker.start();
     Emitter e;
-    e.moveToThread(&worker);
+    e.moveToThread(&worker); // legal while the thread is not yet running
 
     QThread * resumedOn = nullptr;
     auto task = awaitOneArgRecordThread73(&e, &resumedOn);
     TEST_ASSERT(!task.await_ready(), "should be suspended");
 
-    // Emit from the worker thread.
+    // Start the worker only after the await is armed: thread creation gives
+    // TSan a visible happens-before edge from the setup to the emission.
+    worker.start();
     QMetaObject::invokeMethod(&e, [&e]() { emit e.oneArg(42); }, Qt::QueuedConnection);
 
     QTimer::singleShot(200, [&]() { app.quit(); });
@@ -2310,7 +2311,6 @@ void test_cross_thread_sender_destroyed(QCoreApplication & app) {
     std::cout << "test_cross_thread_sender_destroyed\n";
 
     QThread worker;
-    worker.start();
     auto * e = new Emitter;
     e->moveToThread(&worker);
 
@@ -2318,6 +2318,7 @@ void test_cross_thread_sender_destroyed(QCoreApplication & app) {
     auto task = awaitVoidRecordThread74(e, &resumedOn);
     TEST_ASSERT(!task.await_ready(), "should be suspended");
 
+    worker.start();                                                          // after setup — see test 73
     QMetaObject::invokeMethod(e, [e]() { delete e; }, Qt::QueuedConnection); // delete on worker thread
 
     QTimer::singleShot(200, [&]() { app.quit(); });
@@ -2354,13 +2355,14 @@ void test_cross_thread_sender_timeout(QCoreApplication & app) {
     std::cout << "test_cross_thread_sender_timeout\n";
 
     QThread worker;
-    worker.start();
     Emitter e;
     e.moveToThread(&worker); // never emits
 
     QThread * resumedOn = nullptr;
     auto task = awaitWithTimeoutRecordThread75(&e, &resumedOn);
     TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    worker.start(); // after setup — see test 73
 
     QTimer::singleShot(200, [&]() { app.quit(); });
     app.exec();

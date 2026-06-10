@@ -94,6 +94,17 @@ inline std::coroutine_handle<> dispatchCompletion(std::coroutine_handle<Promise>
 // is destroyed while suspended, the task's completion would resume the
 // destroyed frame. whenAll/whenAny guard against this internally; a plain
 // co_await on a task you don't own cannot.
+//
+// Threading contract: a QTask belongs to the thread that created it. While
+// the task is live, owner-side operations — co_await, then/onCancelled/
+// onError, toFuture, detach, destruction — must happen on that thread
+// (debug-asserted). Once settled, querying and destroying are safe from any
+// thread that has synchronized with the completion. Inputs are always
+// unrestricted: signals may be emitted, futures completed, and
+// request_stop() called from any thread — the awaitables marshal the resume
+// back to the right thread. After .resumeOn(ctx) migrates a coroutine to
+// another thread, the original thread must treat the handle as foreign
+// until settled (bridge results with toFuture()).
 template<typename T>
 class QTask {
 
