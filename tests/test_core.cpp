@@ -2237,6 +2237,21 @@ void test_whenAny_awaiter_destroyed() {
     TEST_ASSERT(!reached, "destroyed whenAny waiter must not resume");
 }
 
+// ====================================================================
+// 72. whenAny constraint rejects QTask<void> (regression: the old
+//     constraint admitted it and instantiation failed deep inside
+//     WhenAnyAwaitable with "forming reference to void")
+// ====================================================================
+
+// Must be a template: only a dependent requires-expression turns the
+// failed overload resolution into `false` instead of a hard error.
+template<typename T>
+constexpr bool whenAnyCompilesFor =
+    requires(QtCoroutine::QTask<T> & a, QtCoroutine::QTask<T> & b) { QtCoroutine::whenAny(a, b); };
+
+static_assert(!whenAnyCompilesFor<void>, "whenAny must cleanly reject QTask<void>");
+static_assert(whenAnyCompilesFor<int>, "whenAny accepts homogeneous non-void tasks");
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 

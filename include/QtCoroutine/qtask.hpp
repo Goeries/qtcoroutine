@@ -37,6 +37,13 @@ namespace QtCoroutine {
 //         task.detach();
 //
 // .detach() is not thread-safe (single-owner semantics).
+//
+// co_await stores the awaiting coroutine's handle in this task's promise.
+// At most one coroutine may await a given task (asserted in debug builds),
+// and an awaited task must not outlive its awaiter: if the awaiting frame
+// is destroyed while suspended, the task's completion would resume the
+// destroyed frame. whenAll/whenAny guard against this internally; a plain
+// co_await on a task you don't own cannot.
 template<typename T>
 class QTask {
 
@@ -175,6 +182,7 @@ public:
     }
 
     bool await_ready() const noexcept {
+        Q_ASSERT_X(m_handle, "QTask::await_ready", "no coroutine attached (moved-from or detached task)");
         return m_handle.done();
     }
 
@@ -184,19 +192,24 @@ public:
     // with eager start, the task is already running and may be suspended
     // at an internal co_await — resuming it here would be UB.
     void await_suspend(std::coroutine_handle<> caller) {
-        m_handle.promise().continuation = caller;
+        auto & p = m_handle.promise();
+        Q_ASSERT_X(!p.continuation, "QTask::co_await", "task is already awaited by another coroutine");
+        p.continuation = caller;
     }
 
     bool isCancelled() const {
+        Q_ASSERT_X(m_handle, "QTask::isCancelled", "no coroutine attached (moved-from or detached task)");
         return m_handle.promise().state == State::cancelled;
     }
 
     QtCoroutine::utils::AwaitCancelled::Reason cancelReason() const {
+        Q_ASSERT_X(m_handle, "QTask::cancelReason", "no coroutine attached (moved-from or detached task)");
         return m_handle.promise().cancelReason;
     }
 
     template<typename F>
     void then(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::then", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::value)
@@ -208,6 +221,7 @@ public:
 
     template<typename F>
     void onCancelled(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::onCancelled", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::cancelled)
@@ -219,6 +233,7 @@ public:
 
     template<typename F>
     void onError(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::onError", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::error)
@@ -379,11 +394,14 @@ public:
     }
 
     bool await_ready() const noexcept {
+        Q_ASSERT_X(m_handle, "QTask::await_ready", "no coroutine attached (moved-from or detached task)");
         return m_handle.done();
     }
 
     void await_suspend(std::coroutine_handle<> caller) {
-        m_handle.promise().continuation = caller;
+        auto & p = m_handle.promise();
+        Q_ASSERT_X(!p.continuation, "QTask::co_await", "task is already awaited by another coroutine");
+        p.continuation = caller;
     }
 
     void await_resume() {
@@ -401,15 +419,18 @@ public:
     }
 
     bool isCancelled() const {
+        Q_ASSERT_X(m_handle, "QTask::isCancelled", "no coroutine attached (moved-from or detached task)");
         return m_handle.promise().state == State::cancelled;
     }
 
     QtCoroutine::utils::AwaitCancelled::Reason cancelReason() const {
+        Q_ASSERT_X(m_handle, "QTask::cancelReason", "no coroutine attached (moved-from or detached task)");
         return m_handle.promise().cancelReason;
     }
 
     template<typename F>
     void then(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::then", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::value)
@@ -421,6 +442,7 @@ public:
 
     template<typename F>
     void onCancelled(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::onCancelled", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::cancelled)
@@ -432,6 +454,7 @@ public:
 
     template<typename F>
     void onError(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::onError", "no coroutine attached (moved-from or detached task)");
         auto & p = m_handle.promise();
         if (m_handle.done()) {
             if (p.state == State::error)
@@ -458,10 +481,6 @@ public:
         });
 
         return qpromise->future();
-    }
-
-    void start() {
-        m_handle.resume();
     }
 
 private:
@@ -667,8 +686,11 @@ struct WhenAnyAwaitable {
 
 } // namespace detail
 
+// QTask<void> is rejected up front: WhenAnyAwaitable would form `const
+// void &` deep inside its callbacks, which produces an impenetrable
+// diagnostic. void and heterogeneous (variant) support are planned.
 template<typename T, typename... Rest>
-    requires(std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
+    requires(!std::is_void_v<T>) && (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
 auto whenAny(QTask<T> & first, Rest &... rest) {
     return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{{&first, &rest...}};
 }
