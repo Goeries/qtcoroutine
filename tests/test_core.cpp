@@ -2527,6 +2527,57 @@ void test_then_with_cross_thread_completion(QCoreApplication & app) {
     worker.wait();
 }
 
+// ====================================================================
+// 80. waitFor — synchronous bridge: blocks on a nested event loop and
+//     returns the result or rethrows cancellation/error. Note: no
+//     app.exec() scaffolding needed; waitFor pumps the timers itself.
+// ====================================================================
+
+QtCoroutine::QTask<void> failingAfterSleep80() {
+    co_await QtCoroutine::sleep(std::chrono::milliseconds(5));
+    throw std::runtime_error("waitFor error");
+}
+
+void test_waitFor() {
+    std::cout << "test_waitFor\n";
+
+    // Already-settled task: returns without spinning.
+    auto done = taskReturnsValue();
+    TEST_ASSERT(QtCoroutine::waitFor(done) == 42, "waitFor returns a settled value immediately");
+
+    // Pending task: waitFor spins until the signal arrives.
+    Emitter e;
+    auto pending = waitOneArg71(&e);
+    QTimer::singleShot(10, [&]() { emit e.oneArg(7); });
+    TEST_ASSERT(QtCoroutine::waitFor(pending) == 7, "waitFor blocks until the task settles");
+
+    // Rvalue task.
+    QTimer::singleShot(10, [&]() { emit e.oneArg(8); });
+    TEST_ASSERT(QtCoroutine::waitFor(waitOneArg71(&e)) == 8, "waitFor accepts a temporary task");
+
+    // Cancellation surfaces as AwaitCancelled.
+    std::stop_source ss;
+    auto cancelled = awaitWithCancel(&e, ss.get_token());
+    QTimer::singleShot(10, [&]() { ss.request_stop(); });
+    bool caught = false;
+    try {
+        QtCoroutine::waitFor(cancelled);
+    } catch (QtCoroutine::utils::AwaitCancelled & c) {
+        caught = c.reason == QtCoroutine::utils::AwaitCancelled::Stopped;
+    }
+    TEST_ASSERT(caught, "waitFor rethrows cancellation as AwaitCancelled");
+
+    // Errors propagate as the original exception.
+    auto failing = failingAfterSleep80();
+    bool errCaught = false;
+    try {
+        QtCoroutine::waitFor(failing);
+    } catch (std::runtime_error & ex) {
+        errCaught = std::string(ex.what()) == "waitFor error";
+    }
+    TEST_ASSERT(errCaught, "waitFor rethrows task errors");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2552,6 +2603,7 @@ int main(int argc, char * argv[]) {
     test_whenAny_awaiter_destroyed();
     test_reassign_task_inside_callback();
     test_detach_inside_callback();
+    test_waitFor();
 
     // Async tests (need event loop)
     test_signal_void(app);

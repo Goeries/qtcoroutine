@@ -9,6 +9,7 @@
 #include <stop_token>
 #include <tuple>
 #include <utility>
+#include <QEventLoop>
 #include <QFuture>
 #include <QMutex>
 #include <QObject>
@@ -897,6 +898,58 @@ template<typename T, typename... Rest>
     requires(!std::is_void_v<T>) && (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
 auto whenAny(QTask<T> & first, Rest &... rest) {
     return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{{&first, &rest...}};
+}
+
+// ------------------------------------------------------------------
+// waitFor — block until a task settles by spinning a nested event
+// loop, then return its result (or rethrow its cancellation/error).
+// The synchronous bridge for main(), tests, and non-coroutine code:
+//
+//     int v = QtCoroutine::waitFor(computeAsync());
+//
+// Call it on the task's owner thread. It occupies the task's single
+// awaiter slot — do not also co_await the task elsewhere.
+// ------------------------------------------------------------------
+
+namespace detail {
+
+// A real function, not a capturing lambda: lambda-coroutine captures live
+// in the (here: temporary) lambda object and dangle after the first
+// suspension, while function parameters are copied into the frame.
+template<typename T>
+QTask<T> waitForBridge(QTask<T> & task) {
+    co_return co_await task;
+}
+
+} // namespace detail
+
+template<typename T>
+T waitFor(QTask<T> & task) {
+    Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "QtCoroutine::waitFor",
+               "waitFor requires an event loop on this thread (construct Q(Core)Application first)");
+
+    auto bridge = detail::waitForBridge(task);
+    if (!bridge.await_ready()) {
+        QEventLoop loop;
+        // Queued quit: if the task settles on another thread between callback
+        // registration and exec(), the posted event is simply waiting when
+        // exec() starts — a direct quit() before exec() would be lost.
+        auto quit = [&loop]() { QMetaObject::invokeMethod(&loop, &QEventLoop::quit, Qt::QueuedConnection); };
+        if constexpr (std::is_void_v<T>) {
+            bridge.then([quit]() { quit(); });
+        } else {
+            bridge.then([quit](const T &) { quit(); });
+        }
+        bridge.onCancelled([quit](const utils::AwaitCancelled &) { quit(); });
+        bridge.onError([quit](std::exception_ptr) { quit(); });
+        loop.exec();
+    }
+    return bridge.await_resume();
+}
+
+template<typename T>
+T waitFor(QTask<T> && task) {
+    return waitFor(task);
 }
 
 // ------------------------------------------------------------------
