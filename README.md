@@ -70,6 +70,8 @@ task.onError([](std::exception_ptr ep) { /* handle */ });
 QFuture<int> future = task.toFuture();
 ```
 
+**Lifetime.** A `QTask` owns its coroutine frame; destroying the task destroys the frame, cancelling any pending awaits. Either `co_await` it from another coroutine, keep it alive until it settles, or call `.detach()` for fire-and-forget — the frame then self-destructs on completion. `QTask` is `[[nodiscard]]`, so accidentally discarding one (`compute();`) is a compiler warning rather than silently lost work. Callbacks fire while the coroutine is suspended, which makes destroying or reassigning a task from inside its own `.then()` callback safe — frame destruction is deferred, like `QObject::deleteLater()` called from a slot.
+
 ### QFuture as Coroutine Return Type
 
 Functions returning `QFuture<T>` are automatically coroutines:
@@ -83,6 +85,8 @@ QFuture<int> pipeline() {
     co_return processed;
 }
 ```
+
+Exceptions thrown by the awaited future rethrow at the `co_await` (unwrapped from `QUnhandledException`), and cancelling the awaited future resumes the coroutine with `AwaitCancelled` once the future settles.
 
 ### Value-Based Error Handling
 
@@ -124,8 +128,10 @@ auto [r1, r2, r3] = co_await QtCoroutine::whenAll(task1, task2, task3);
 // Wait for all tasks (short-circuits on first error)
 auto [r1, r2] = co_await QtCoroutine::tryAll(task1, task2);
 
-// Wait for first to complete
-auto winner = co_await QtCoroutine::whenAny(task1, task2);
+// Race tasks — the first to settle wins
+auto [index, value] = co_await QtCoroutine::whenAny(taskA, taskB);  // same T: winner index + value
+std::size_t winner = co_await QtCoroutine::whenAny(voidA, voidB);   // all void: winner index
+auto either = co_await QtCoroutine::whenAny(intTask, stringTask);   // mixed: std::variant<int, QString>
 
 // Timeout on any QTask
 auto result = co_await QtCoroutine::withTimeout(task, std::chrono::seconds(5));
@@ -135,6 +141,14 @@ auto result = co_await QtCoroutine::cancelledBy(task, stopToken);
 
 // Sleep
 co_await QtCoroutine::sleep(std::chrono::milliseconds(500));
+```
+
+### Blocking Bridge — `waitFor`
+
+For `main()`, tests, and other non-coroutine code, `waitFor` blocks on a nested event loop until the task settles, then returns its value or rethrows its cancellation/error:
+
+```cpp
+int value = QtCoroutine::waitFor(compute());
 ```
 
 ## Headers
@@ -162,8 +176,19 @@ stopSource.request_stop();  // cancels wherever the coroutine is suspended
 
 // From non-coroutine code
 if (task.isCancelled())
-    qDebug() << task.cancelReason();  // Stopped, SenderDestroyed, Timeout, etc.
+    qDebug() << *task.cancelReason();  // Stopped, SenderDestroyed, Timeout, ...
 ```
+
+`cancelReason()` returns `std::optional<AwaitCancelled::Reason>`, engaged only when the task was actually cancelled (it still compares directly against reasons: `task.cancelReason() == AwaitCancelled::Stopped`). `QtCoroutine::AwaitCancelled` is the public spelling of the cancellation type.
+
+## Threading
+
+The defaults follow `QObject::connect`: the suspended coroutine is the receiver, and resuming it is the slot.
+
+- A `co_await` resumes on the thread it suspended on, regardless of which thread the sender lives on or emits from — code after the `co_await` runs on the same thread as the code before it. A same-thread emission resumes synchronously inside the `emit`, exactly like a direct-connected slot.
+- `.resumeOn(ctx)` explicitly migrates the coroutine: delivery and everything after the `co_await` run on `ctx`'s thread.
+- Inputs are unrestricted: signals may be emitted, futures completed, and `request_stop()` called from any thread; the library marshals the resume back to the right thread.
+- The task handle is thread-affine: while a task is live, owner-side operations — `co_await`, `then`/`onCancelled`/`onError`, `toFuture`, `detach`, destruction — belong on the thread that created it (debug-asserted). Once settled, querying and destroying are safe from any thread that has synchronized with the completion. After migrating with `resumeOn`, bridge results back with `toFuture()`.
 
 ## Integration
 
@@ -215,18 +240,19 @@ target_link_libraries(myapp PRIVATE qtcoroutine::qtcoroutine)
 
 ### Copy headers
 
-Copy `include/QtCoroutine/` into your project and add to your include path:
+Copy `include/` into your project and add **both** directories to your include path — the first for `#include <QtCoroutine/qtask.hpp>` style includes, the second so the umbrella `#include <QtCoroutine>` resolves:
 
 ```cmake
-target_include_directories(myapp PRIVATE path/to/include)
+target_include_directories(myapp PRIVATE path/to/include path/to/include/QtCoroutine)
 target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
 ```
 
 ## Requirements
 
-- C++23 (GCC 13+, MSVC 2022 17.5+)
+- C++23 (GCC 13+, MSVC 2022 17.5+; Clang with libstdc++ is currently unsupported — libstdc++'s `std::expected` requires GCC)
 - Qt 6
 - CMake 3.22+
+- A running Qt event loop on every awaiting thread (asserted in debug builds; in a release build an await without one simply never resumes)
 
 ## Naming: `connect()` vs `signal()`
 
@@ -236,8 +262,9 @@ target_link_libraries(myapp PRIVATE Qt6::Core Qt6::Concurrent)
 
 | Compiler | Platform |
 |----------|----------|
-| GCC 13.3 | Ubuntu 24.04 (WSL2) |
-| MinGW GCC | Windows 11 |
+| GCC 13.3 | Ubuntu 24.04 — including AddressSanitizer and ThreadSanitizer CI jobs |
+| MSVC 2022 | Windows |
+| MinGW GCC 13 | Windows 11 |
 
 ## License
 
