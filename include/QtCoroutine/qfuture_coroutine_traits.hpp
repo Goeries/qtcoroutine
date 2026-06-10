@@ -1,7 +1,11 @@
 #pragma once
+#include <atomic>
 #include <coroutine>
+#include <memory>
+#include <stdexcept>
 #include <QFuture>
-#include <QFutureWatcher>
+#include <QObject>
+#include <QThread>
 #include "utils.hpp"
 
 // These coroutine_traits specializations are allowed in `std` because coroutine_traits is meant to be extended

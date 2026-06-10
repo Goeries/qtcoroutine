@@ -16,15 +16,6 @@
 
 namespace QtCoroutine {
 
-namespace detail {
-
-template<typename F, typename Sender, typename Signal>
-concept ValidReadyCheck = std::is_same_v<std::remove_cvref_t<F>, std::nullptr_t> ||
-                          (std::invocable<F, Sender *> &&
-                           std::convertible_to<std::invoke_result_t<F, Sender *>, utils::ReadyCheckResultT<Signal>>);
-
-} // namespace detail
-
 // ------------------------------------------------------------------
 // ExpectedAwaitable – wraps any awaitable so await_resume returns
 // std::expected<T, AwaitCancelled> instead of throwing.
@@ -145,29 +136,29 @@ public:
 
     // ---- Builder methods (rvalue-qualified for safe chaining) ----
 
-    QSignalAwaitable resumeOn(QObject * ctx) && {
+    [[nodiscard]] QSignalAwaitable resumeOn(QObject * ctx) && {
         m_resumeCtx = ctx;
         return std::move(*this);
     }
 
-    QSignalAwaitable cancelledBy(std::stop_token st) && {
+    [[nodiscard]] QSignalAwaitable cancelledBy(std::stop_token st) && {
         m_stop = std::move(st);
         return std::move(*this);
     }
 
-    QSignalAwaitable withTimeout(std::chrono::milliseconds ms) && {
+    [[nodiscard]] QSignalAwaitable withTimeout(std::chrono::milliseconds ms) && {
         m_timeout = ms;
         return std::move(*this);
     }
 
-    ExpectedAwaitable<QSignalAwaitable> asExpected() && {
+    [[nodiscard]] ExpectedAwaitable<QSignalAwaitable> asExpected() && {
         return ExpectedAwaitable<QSignalAwaitable>(std::move(*this));
     }
 
     template<typename F>
         requires std::invocable<std::decay_t<F>, Sender *> &&
                  std::convertible_to<std::invoke_result_t<std::decay_t<F>, Sender *>, utils::ReadyCheckResultT<Signal>>
-    QSignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
+    [[nodiscard]] QSignalAwaitable<Sender, Signal, std::decay_t<F>> readyIf(F && check) && {
         return {m_sender, m_signal, m_resumeCtx, std::move(m_stop), m_timeout, std::forward<F>(check)};
     }
 
@@ -341,7 +332,7 @@ private:
 
 template<typename Sender, typename Signal>
     requires std::derived_from<Sender, QObject>
-auto signal(Sender * sender, Signal sig) {
+[[nodiscard]] auto signal(Sender * sender, Signal sig) {
     return QSignalAwaitable<Sender, Signal>(sender, sig);
 }
 
@@ -353,7 +344,7 @@ auto signal(Sender * sender, Signal sig) {
 
 template<typename Sender, typename Signal>
     requires std::derived_from<Sender, QObject>
-auto connect(Sender * sender, Signal sig) {
+[[nodiscard]] auto connect(Sender * sender, Signal sig) {
     return QSignalAwaitable<Sender, Signal>(sender, sig);
 }
 
@@ -361,7 +352,7 @@ auto connect(Sender * sender, Signal sig) {
 // sleep() – suspend for a duration (wraps QTimer::singleShot)
 // ------------------------------------------------------------------
 
-inline auto sleep(std::chrono::milliseconds ms) {
+[[nodiscard]] inline auto sleep(std::chrono::milliseconds ms) {
     struct SleepAwaitable {
         std::chrono::milliseconds duration;
         std::shared_ptr<std::atomic<bool>> guard;

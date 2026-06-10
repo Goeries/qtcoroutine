@@ -2767,6 +2767,40 @@ void test_whenAny_variant_awaiter_destroyed() {
     TEST_ASSERT(!reached, "destroyed variant whenAny waiter must not resume");
 }
 
+// ====================================================================
+// 84. API hygiene: namespace alias, optional cancelReason, contained
+//     callback exceptions
+// ====================================================================
+
+void test_hygiene_api() {
+    std::cout << "test_hygiene_api\n";
+
+    static_assert(std::is_same_v<QtCoroutine::AwaitCancelled, QtCoroutine::utils::AwaitCancelled>,
+                  "AwaitCancelled is aliased at namespace scope");
+
+    // cancelReason() engages only on cancelled tasks.
+    auto ok = taskReturnsValue();
+    TEST_ASSERT(!ok.isCancelled(), "successful task not cancelled");
+    TEST_ASSERT(!ok.cancelReason().has_value(), "cancelReason empty on a successful task");
+
+    Emitter e;
+    std::stop_source ss;
+    ss.request_stop();
+    auto cancelled = awaitPreStoppedVoid(&e, ss.get_token());
+    TEST_ASSERT(cancelled.isCancelled(), "pre-stopped task cancelled");
+    TEST_ASSERT(cancelled.cancelReason().has_value(), "cancelReason engaged on a cancelled task");
+    TEST_ASSERT(cancelled.cancelReason() == QtCoroutine::AwaitCancelled::Stopped,
+                "optional<Reason> compares against plain Reason");
+
+    // A throwing callback is contained (qWarning'd) and the task settles.
+    Emitter e2;
+    auto pending = waitOneArg71(&e2);
+    pending.then([](const int &) { throw std::runtime_error("callback boom"); });
+    emit e2.oneArg(1);
+    TEST_ASSERT(pending.await_ready(), "task settles despite a throwing callback");
+    TEST_ASSERT(!pending.isCancelled(), "task state intact despite a throwing callback");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2799,6 +2833,7 @@ int main(int argc, char * argv[]) {
     test_whenAny_variant_error();
     test_whenAny_void_awaiter_destroyed();
     test_whenAny_variant_awaiter_destroyed();
+    test_hygiene_api();
 
     // Async tests (need event loop)
     test_signal_void(app);

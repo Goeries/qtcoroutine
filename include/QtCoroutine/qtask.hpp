@@ -180,7 +180,9 @@ struct TaskPromise : TaskPromiseBase {
             default:
                 break;
             }
-        } catch (...) {}
+        } catch (...) {
+            qWarning("QtCoroutine: exception thrown from a QTask callback was ignored");
+        }
     }
 
     std::optional<T> result;
@@ -216,7 +218,9 @@ struct TaskPromise<void> : TaskPromiseBase {
             default:
                 break;
             }
-        } catch (...) {}
+        } catch (...) {
+            qWarning("QtCoroutine: exception thrown from a QTask callback was ignored");
+        }
     }
 
     std::function<void()> thenCallback;
@@ -297,15 +301,20 @@ public:
         return true;
     }
 
-    bool isCancelled() const {
+    [[nodiscard]] bool isCancelled() const {
         Q_ASSERT_X(m_handle, "QTask::isCancelled", "no coroutine attached (moved-from or detached task)");
         QMutexLocker lock(&m_handle.promise().mutex);
         return m_handle.promise().state == TaskState::cancelled;
     }
 
-    QtCoroutine::utils::AwaitCancelled::Reason cancelReason() const {
+    // Engaged only when the task actually settled by cancellation.
+    // optional<Reason> still compares against plain Reason values, so
+    // `task.cancelReason() == AwaitCancelled::Stopped` reads naturally.
+    [[nodiscard]] std::optional<QtCoroutine::utils::AwaitCancelled::Reason> cancelReason() const {
         Q_ASSERT_X(m_handle, "QTask::cancelReason", "no coroutine attached (moved-from or detached task)");
         QMutexLocker lock(&m_handle.promise().mutex);
+        if (m_handle.promise().state != TaskState::cancelled)
+            return std::nullopt;
         return m_handle.promise().cancelReason;
     }
 
@@ -417,7 +426,9 @@ protected:
 // another thread, the original thread must treat the handle as foreign
 // until settled (bridge results with toFuture()).
 template<typename T>
-class QTask : public detail::TaskBase<detail::TaskPromise<T>> {
+class [[nodiscard(
+    "discarding a QTask destroys the coroutine frame at the end of the statement — keep it, co_await it, or "
+    "detach()")]] QTask : public detail::TaskBase<detail::TaskPromise<T>> {
     using Base = detail::TaskBase<detail::TaskPromise<T>>;
     using Base::m_handle;
     using Base::m_settled;
@@ -447,7 +458,7 @@ public:
     // Bridge to QFuture — allows use with QFutureWatcher, QtFuture::whenAll, etc.
     // Consumes the .then/.onCancelled/.onError callbacks; use QFuture's
     // continuation API after calling this.
-    QFuture<T> toFuture() {
+    [[nodiscard]] QFuture<T> toFuture() {
         auto qpromise = std::make_shared<QPromise<T>>();
         qpromise->start();
 
@@ -487,7 +498,9 @@ public:
 
 // QTask<void> specialization
 template<>
-class QTask<void> : public detail::TaskBase<detail::TaskPromise<void>> {
+class [[nodiscard(
+    "discarding a QTask destroys the coroutine frame at the end of the statement — keep it, co_await it, or "
+    "detach()")]] QTask<void> : public detail::TaskBase<detail::TaskPromise<void>> {
     using Base = detail::TaskBase<detail::TaskPromise<void>>;
 
 public:
@@ -526,7 +539,7 @@ public:
         }
     }
 
-    QFuture<void> toFuture() {
+    [[nodiscard]] QFuture<void> toFuture() {
         auto qpromise = std::make_shared<QPromise<void>>();
         qpromise->start();
 
@@ -670,13 +683,13 @@ struct WhenAllVoidAwaitable {
 
 template<typename... Ts>
     requires(sizeof...(Ts) > 0) && ((!std::is_void_v<Ts>) && ...)
-auto whenAll(QTask<Ts> &... tasks) {
+[[nodiscard]] auto whenAll(QTask<Ts> &... tasks) {
     return detail::WhenAllAwaitable<Ts...>{std::tuple{&tasks...}};
 }
 
 template<std::same_as<QTask<void>>... Tasks>
     requires(sizeof...(Tasks) > 0)
-auto whenAll(Tasks &... tasks) {
+[[nodiscard]] auto whenAll(Tasks &... tasks) {
     return detail::WhenAllVoidAwaitable<sizeof...(Tasks)>{{&tasks...}};
 }
 
@@ -883,14 +896,14 @@ struct WhenAnyVariantAwaitable {
 // Homogeneous value tasks: {index, value} of the winner.
 template<typename T, typename... Rest>
     requires(!std::is_void_v<T>) && (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
-auto whenAny(QTask<T> & first, Rest &... rest) {
+[[nodiscard]] auto whenAny(QTask<T> & first, Rest &... rest) {
     return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{{&first, &rest...}};
 }
 
 // All-void tasks: the winner's index.
 template<std::same_as<QTask<void>>... Tasks>
     requires(sizeof...(Tasks) > 0)
-auto whenAny(Tasks &... tasks) {
+[[nodiscard]] auto whenAny(Tasks &... tasks) {
     return detail::WhenAnyVoidAwaitable<sizeof...(Tasks)>{{&tasks...}};
 }
 
@@ -900,7 +913,7 @@ auto whenAny(Tasks &... tasks) {
 template<typename First, typename... Rest>
     requires(sizeof...(Rest) > 0) && (!std::is_void_v<First>) && ((!std::is_void_v<Rest>) && ...) &&
             (!(std::same_as<First, Rest> && ...))
-auto whenAny(QTask<First> & first, QTask<Rest> &... rest) {
+[[nodiscard]] auto whenAny(QTask<First> & first, QTask<Rest> &... rest) {
     return detail::WhenAnyVariantAwaitable<First, Rest...>{{&first, &rest...}};
 }
 

@@ -1,5 +1,4 @@
 #pragma once
-#include <concepts>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -68,10 +67,10 @@ using ConnectResultT = typename detail::ConnectResultImpl<SignalArgs<Signal>::co
 
 struct AwaitCancelled {
     enum Reason : uint8_t {
-        Stopped = 0b000,                // stop_token triggered
-        SenderDestroyed = 0b001,        // sender QObject destroyed
-        ResumeContextDestroyed = 0b010, // resumeContext QObject destroyed
-        Timeout = 0b100                 // withTimeout expired
+        Stopped,                // stop_token triggered
+        SenderDestroyed,        // sender QObject destroyed
+        ResumeContextDestroyed, // resumeContext QObject destroyed
+        Timeout                 // withTimeout expired
     } reason;
 
     constexpr bool wasStopped() const {
@@ -108,3 +107,9 @@ struct AwaitCancelled {
 };
 
 } // namespace QtCoroutine::utils
+
+namespace QtCoroutine {
+// AwaitCancelled appears in every user-facing cancellation signature;
+// spare callers the utils:: spelling.
+using AwaitCancelled = utils::AwaitCancelled;
+} // namespace QtCoroutine
