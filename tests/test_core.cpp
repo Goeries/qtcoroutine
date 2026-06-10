@@ -2418,6 +2418,113 @@ void test_resumeOn_migrates_to_ctx_thread(QCoreApplication & app) {
     worker.wait();
 }
 
+// ====================================================================
+// 77. Reassigning a task from inside its own .then() callback — the
+//     "deleteLater from your own slot" case (regression: callbacks used
+//     to fire from return_value with the coroutine still running, so
+//     destroying the frame there was UB)
+// ====================================================================
+
+void test_reassign_task_inside_callback() {
+    std::cout << "test_reassign_task_inside_callback\n";
+
+    Emitter e;
+    std::optional<QtCoroutine::QTask<int>> slot;
+    slot.emplace(waitOneArg71(&e));
+    TEST_ASSERT(!slot->await_ready(), "first task suspended");
+
+    bool callbackRan = false;
+    slot->then([&](const int & v) {
+        TEST_ASSERT(v == 11, "first task result delivered");
+        // Destroys the first task from inside its own completion callback.
+        // Frame destruction is deferred to the dispatcher — no UAF, no leak.
+        slot.emplace(taskReturnsValue());
+        callbackRan = true;
+    });
+
+    emit e.oneArg(11);
+
+    TEST_ASSERT(callbackRan, "callback ran");
+    TEST_ASSERT(slot->await_ready(), "replacement task settled");
+    TEST_ASSERT(slot->await_resume() == 42, "replacement task usable immediately");
+}
+
+// ====================================================================
+// 78. detach() from inside the task's own callback: the completion
+//     dispatch self-destructs the frame (no leak, no double-destroy)
+// ====================================================================
+
+void test_detach_inside_callback() {
+    std::cout << "test_detach_inside_callback\n";
+
+    Emitter e;
+    std::optional<QtCoroutine::QTask<int>> slot;
+    slot.emplace(waitOneArg71(&e));
+
+    bool callbackRan = false;
+    slot->then([&](const int &) {
+        slot->detach(); // mid-dispatch detach: dispatcher self-destructs the frame
+        callbackRan = true;
+    });
+
+    emit e.oneArg(5);
+    TEST_ASSERT(callbackRan, "callback ran and detach from inside it did not crash");
+}
+
+// ====================================================================
+// 79. Cross-thread completion (resumeOn migration): a then() registered
+//     before completion fires on the completion thread; one registered
+//     after settling fires immediately on the registering thread. The
+//     promise mutex makes both registrations race-free.
+// ====================================================================
+
+QtCoroutine::QTask<int> migrateAndReturn79(Emitter * e, QObject * ctx) {
+    int v = co_await QtCoroutine::signal(e, &Emitter::oneArg).resumeOn(ctx);
+    co_return v; // completes on ctx's thread
+}
+
+void test_then_with_cross_thread_completion(QCoreApplication & app) {
+    std::cout << "test_then_with_cross_thread_completion\n";
+
+    QThread worker;
+    worker.start();
+    while (!worker.eventDispatcher())
+        QThread::msleep(1);
+
+    Emitter e; // sender on the main thread
+    QObject ctx;
+    ctx.moveToThread(&worker);
+
+    auto task = migrateAndReturn79(&e, &ctx);
+
+    std::atomic<QThread *> preThread{nullptr};
+    task.then([&](const int & v) {
+        if (v == 9)
+            preThread.store(QThread::currentThread(), std::memory_order_release);
+    });
+
+    emit e.oneArg(9); // queued to the worker; the task completes there
+
+    QTimer::singleShot(300, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "task settled (cross-thread settled read)");
+    TEST_ASSERT(preThread.load(std::memory_order_acquire) == &worker,
+                "pre-registered then fires on the completion thread");
+
+    QThread * postThread = nullptr;
+    int postVal = 0;
+    task.then([&](const int & v) {
+        postVal = v;
+        postThread = QThread::currentThread();
+    });
+    TEST_ASSERT(postVal == 9, "post-settle then fires immediately with the value");
+    TEST_ASSERT(postThread == QThread::currentThread(), "post-settle then runs on the registering thread");
+
+    worker.quit();
+    worker.wait();
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2441,6 +2548,8 @@ int main(int argc, char * argv[]) {
     test_whenAll_awaiter_destroyed();
     test_whenAll_void_awaiter_destroyed();
     test_whenAny_awaiter_destroyed();
+    test_reassign_task_inside_callback();
+    test_detach_inside_callback();
 
     // Async tests (need event loop)
     test_signal_void(app);
@@ -2505,6 +2614,7 @@ int main(int argc, char * argv[]) {
     test_cross_thread_sender_destroyed(app);
     test_cross_thread_sender_timeout(app);
     test_resumeOn_migrates_to_ctx_thread(app);
+    test_then_with_cross_thread_completion(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
