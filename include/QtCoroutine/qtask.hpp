@@ -480,6 +480,16 @@ namespace detail {
 template<typename... Ts>
 struct WhenAllAwaitable {
     std::tuple<QTask<Ts> *...> tasks;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    // The callbacks registered on the (caller-owned) tasks outlive this
+    // awaitable. If the awaiting coroutine frame is destroyed while
+    // suspended, the destructor marks them stale so a later task
+    // completion doesn't resume the destroyed frame.
+    ~WhenAllAwaitable() {
+        if (guard)
+            guard->store(true, std::memory_order_release);
+    }
 
     bool await_ready() {
         return std::apply([](auto *... ptrs) { return (ptrs->await_ready() && ...); }, tasks);
@@ -488,14 +498,17 @@ struct WhenAllAwaitable {
     void await_suspend(std::coroutine_handle<> handle) {
         constexpr auto N = sizeof...(Ts);
         auto remaining = std::make_shared<std::atomic<std::size_t>>(N);
+        guard = std::make_shared<std::atomic<bool>>(false);
 
         // The last task to complete resumes the outer coroutine.
         // If the task is already at final_suspend (done), resume directly.
         // Otherwise, set its continuation so final_suspend resumes us —
         // this avoids destroying a running coroutine (the callback fires
         // from return_value, before final_suspend).
-        auto setupTask = [remaining, handle](auto * task) {
-            auto onComplete = [remaining, handle, task]() {
+        auto setupTask = [remaining, handle, g = guard](auto * task) {
+            auto onComplete = [remaining, handle, g, task]() {
+                if (g->load(std::memory_order_acquire))
+                    return;
                 if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     if (task->await_ready())
                         handle.resume();
@@ -519,6 +532,13 @@ struct WhenAllAwaitable {
 template<std::size_t N>
 struct WhenAllVoidAwaitable {
     std::array<QTask<void> *, N> tasks;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    // See WhenAllAwaitable: drop stale completions after frame destruction.
+    ~WhenAllVoidAwaitable() {
+        if (guard)
+            guard->store(true, std::memory_order_release);
+    }
 
     bool await_ready() {
         for (auto * t : tasks)
@@ -529,9 +549,12 @@ struct WhenAllVoidAwaitable {
 
     void await_suspend(std::coroutine_handle<> handle) {
         auto remaining = std::make_shared<std::atomic<std::size_t>>(N);
+        guard = std::make_shared<std::atomic<bool>>(false);
 
         for (auto * task : tasks) {
-            auto onComplete = [remaining, handle, task]() {
+            auto onComplete = [remaining, handle, g = guard, task]() {
+                if (g->load(std::memory_order_acquire))
+                    return;
                 if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
                     if (task->await_ready())
                         handle.resume();
@@ -585,7 +608,8 @@ QTask<void> tryAll(Tasks &... tasks) {
 
 // ------------------------------------------------------------------
 // whenAny — co_await multiple QTasks, resume when the first completes.
-// Returns {index, result} of the winning task. Homogeneous types only.
+// Returns the winning task's result (value, or rethrows its cancellation
+// or error). Homogeneous types only.
 // Consumes .then/.onCancelled/.onError callbacks on all tasks.
 // ------------------------------------------------------------------
 
@@ -595,6 +619,16 @@ template<typename T, std::size_t N>
 struct WhenAnyAwaitable {
     std::array<QTask<T> *, N> tasks;
     std::size_t readyIndex = 0;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    // The guard doubles as the only-one-winner gate (exchange below) and
+    // as the staleness flag: if the awaiting frame is destroyed while
+    // suspended, the destructor sets it so the losing tasks' callbacks —
+    // which capture `this` — never touch the destroyed awaitable/frame.
+    ~WhenAnyAwaitable() {
+        if (guard)
+            guard->store(true, std::memory_order_release);
+    }
 
     bool await_ready() {
         for (std::size_t i = 0; i < N; ++i) {
@@ -607,10 +641,10 @@ struct WhenAnyAwaitable {
     }
 
     void await_suspend(std::coroutine_handle<> handle) {
-        auto guard = std::make_shared<std::atomic<bool>>(false);
+        guard = std::make_shared<std::atomic<bool>>(false);
         for (std::size_t i = 0; i < N; ++i) {
-            auto resume = [this, i, handle, guard]() {
-                if (guard->exchange(true, std::memory_order_acq_rel))
+            auto resume = [this, i, handle, g = guard]() {
+                if (g->exchange(true, std::memory_order_acq_rel))
                     return;
                 readyIndex = i;
                 if (tasks[i]->await_ready())

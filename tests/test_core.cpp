@@ -2147,6 +2147,96 @@ void test_withTimeout_readyIf_order(QCoreApplication & app) {
     app.exec();
 }
 
+// ====================================================================
+// 71. whenAll/whenAny awaiter destroyed while suspended (regression:
+//     the callbacks registered on the caller-owned tasks had no
+//     destructor guard — whenAll's onComplete had no guard at all —
+//     and a later task completion resumed the destroyed frame; UAF
+//     under ASan)
+// ====================================================================
+
+QtCoroutine::QTask<int> waitOneArg71(Emitter * e) {
+    co_return co_await QtCoroutine::signal(e, &Emitter::oneArg);
+}
+
+QtCoroutine::QTask<void> waitVoid71(Emitter * e) {
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal);
+}
+
+QtCoroutine::QTask<void> whenAllWaiter71(QtCoroutine::QTask<int> & a, QtCoroutine::QTask<int> & b, bool * reached) {
+    co_await QtCoroutine::whenAll(a, b);
+    *reached = true;
+}
+
+QtCoroutine::QTask<void> whenAllVoidWaiter71(QtCoroutine::QTask<void> & a, QtCoroutine::QTask<void> & b,
+                                             bool * reached) {
+    co_await QtCoroutine::whenAll(a, b);
+    *reached = true;
+}
+
+QtCoroutine::QTask<void> whenAnyWaiter71(QtCoroutine::QTask<int> & a, QtCoroutine::QTask<int> & b, bool * reached) {
+    co_await QtCoroutine::whenAny(a, b);
+    *reached = true;
+}
+
+void test_whenAll_awaiter_destroyed() {
+    std::cout << "test_whenAll_awaiter_destroyed\n";
+
+    Emitter e1, e2;
+    auto t1 = waitOneArg71(&e1);
+    auto t2 = waitOneArg71(&e2);
+
+    bool reached = false;
+    {
+        auto waiter = whenAllWaiter71(t1, t2, &reached);
+        TEST_ASSERT(!waiter.await_ready(), "whenAll waiter should be suspended");
+    } // waiter frame destroyed; t1/t2 still hold its callbacks
+
+    emit e1.oneArg(1);
+    emit e2.oneArg(2); // last completion fires the stale onComplete — must be dropped
+
+    TEST_ASSERT(t1.await_ready() && t2.await_ready(), "inner tasks completed normally");
+    TEST_ASSERT(!reached, "destroyed whenAll waiter must not resume");
+}
+
+void test_whenAll_void_awaiter_destroyed() {
+    std::cout << "test_whenAll_void_awaiter_destroyed\n";
+
+    Emitter e1, e2;
+    auto t1 = waitVoid71(&e1);
+    auto t2 = waitVoid71(&e2);
+
+    bool reached = false;
+    {
+        auto waiter = whenAllVoidWaiter71(t1, t2, &reached);
+        TEST_ASSERT(!waiter.await_ready(), "void whenAll waiter should be suspended");
+    }
+
+    emit e1.voidSignal();
+    emit e2.voidSignal();
+
+    TEST_ASSERT(t1.await_ready() && t2.await_ready(), "inner void tasks completed normally");
+    TEST_ASSERT(!reached, "destroyed void whenAll waiter must not resume");
+}
+
+void test_whenAny_awaiter_destroyed() {
+    std::cout << "test_whenAny_awaiter_destroyed\n";
+
+    Emitter e1, e2;
+    auto t1 = waitOneArg71(&e1);
+    auto t2 = waitOneArg71(&e2);
+
+    bool reached = false;
+    {
+        auto waiter = whenAnyWaiter71(t1, t2, &reached);
+        TEST_ASSERT(!waiter.await_ready(), "whenAny waiter should be suspended");
+    }
+
+    emit e1.oneArg(1); // first completion — stale resume must be dropped
+
+    TEST_ASSERT(!reached, "destroyed whenAny waiter must not resume");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2167,6 +2257,9 @@ int main(int argc, char * argv[]) {
     test_detach_already_done();
     test_precancelled_stop_token();
     test_qfuture_already_failed();
+    test_whenAll_awaiter_destroyed();
+    test_whenAll_void_awaiter_destroyed();
+    test_whenAny_awaiter_destroyed();
 
     // Async tests (need event loop)
     test_signal_void(app);
