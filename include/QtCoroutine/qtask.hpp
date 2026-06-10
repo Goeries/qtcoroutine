@@ -9,6 +9,7 @@
 #include <stop_token>
 #include <tuple>
 #include <utility>
+#include <variant>
 #include <QEventLoop>
 #include <QFuture>
 #include <QMutex>
@@ -831,11 +832,29 @@ QTask<void> tryAll(Tasks &... tasks) {
 }
 
 // ------------------------------------------------------------------
-// whenAny — co_await multiple QTasks, resume when the first completes.
-// Returns the winning task's result (value, or rethrows its cancellation
-// or error). Homogeneous types only.
+// whenAny — co_await multiple QTasks, resume when the first SETTLES
+// (value, cancellation, or error — a slower success does not override
+// an earlier failure). The losing tasks keep running.
 // Consumes .then/.onCancelled/.onError callbacks on all tasks.
+//
+// Result shapes:
+//  - homogeneous QTask<T>:  WhenAnyResult<T>{index, value}
+//                           auto [i, v] = co_await whenAny(a, b);
+//  - all QTask<void>:       std::size_t — the winner's index
+//  - mixed value types:     std::variant<Ts...> — the winner is
+//                           variant::index() (argument position, which
+//                           also disambiguates repeated types)
+//
+// In every shape, a winner that settled by cancellation or error
+// rethrows instead of returning. Mixing QTask<void> with value tasks
+// is not supported.
 // ------------------------------------------------------------------
+
+template<typename T>
+struct WhenAnyResult {
+    std::size_t index; // argument position of the winning task
+    T value;
+};
 
 namespace detail {
 
@@ -882,22 +901,140 @@ struct WhenAnyAwaitable {
         }
     }
 
-    // Delegates to the winning task's await_resume — returns value,
-    // or throws AwaitCancelled / rethrows on error.
-    T await_resume() {
-        return tasks[readyIndex]->await_resume();
+    // {index, value} of the winning task — or rethrows its cancellation
+    // or error.
+    WhenAnyResult<T> await_resume() {
+        return {readyIndex, tasks[readyIndex]->await_resume()};
+    }
+};
+
+template<std::size_t N>
+struct WhenAnyVoidAwaitable {
+    std::array<QTask<void> *, N> tasks;
+    std::size_t readyIndex = 0;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    // See WhenAnyAwaitable.
+    ~WhenAnyVoidAwaitable() {
+        if (guard)
+            guard->store(true, std::memory_order_release);
+    }
+
+    bool await_ready() {
+        for (std::size_t i = 0; i < N; ++i) {
+            if (tasks[i]->await_ready()) {
+                readyIndex = i;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        guard = std::make_shared<std::atomic<bool>>(false);
+        for (std::size_t i = 0; i < N; ++i) {
+            auto resume = [this, i, handle, g = guard]() {
+                if (g->exchange(true, std::memory_order_acq_rel))
+                    return;
+                readyIndex = i;
+                if (tasks[i]->await_ready())
+                    handle.resume();
+                else
+                    tasks[i]->await_suspend(handle);
+            };
+            tasks[i]->then([resume]() { resume(); });
+            tasks[i]->onCancelled([resume](const auto &) { resume(); });
+            tasks[i]->onError([resume](auto) { resume(); });
+        }
+    }
+
+    // The winner's index — or rethrows its cancellation or error.
+    std::size_t await_resume() {
+        tasks[readyIndex]->await_resume();
+        return readyIndex;
+    }
+};
+
+template<typename... Ts>
+struct WhenAnyVariantAwaitable {
+    std::tuple<QTask<Ts> *...> tasks;
+    std::size_t readyIndex = 0;
+    std::shared_ptr<std::atomic<bool>> guard;
+
+    // See WhenAnyAwaitable.
+    ~WhenAnyVariantAwaitable() {
+        if (guard)
+            guard->store(true, std::memory_order_release);
+    }
+
+    bool await_ready() {
+        return [this]<std::size_t... Is>(std::index_sequence<Is...>) {
+            return ((std::get<Is>(tasks)->await_ready() && (readyIndex = Is, true)) || ...);
+        }(std::index_sequence_for<Ts...>{});
+    }
+
+    void await_suspend(std::coroutine_handle<> handle) {
+        guard = std::make_shared<std::atomic<bool>>(false);
+        [this, handle]<std::size_t... Is>(std::index_sequence<Is...>) {
+            (this->template armOne<Is>(handle), ...);
+        }(std::index_sequence_for<Ts...>{});
+    }
+
+    template<std::size_t I>
+    void armOne(std::coroutine_handle<> handle) {
+        auto * task = std::get<I>(tasks);
+        auto resume = [this, handle, g = guard]() {
+            if (g->exchange(true, std::memory_order_acq_rel))
+                return;
+            readyIndex = I;
+            if (std::get<I>(tasks)->await_ready())
+                handle.resume();
+            else
+                std::get<I>(tasks)->await_suspend(handle);
+        };
+        using Ti = std::tuple_element_t<I, std::tuple<Ts...>>;
+        task->then([resume](const Ti &) { resume(); });
+        task->onCancelled([resume](const auto &) { resume(); });
+        task->onError([resume](auto) { resume(); });
+    }
+
+    // The variant holding the winner's value at the winner's index — or
+    // rethrows its cancellation or error.
+    std::variant<Ts...> await_resume() {
+        return [this]<std::size_t... Is>(std::index_sequence<Is...>) {
+            std::optional<std::variant<Ts...>> out;
+            (void)((readyIndex == Is &&
+                    (out.emplace(std::in_place_index<Is>, std::get<Is>(tasks)->await_resume()), true)) ||
+                   ...);
+            return std::move(*out);
+        }(std::index_sequence_for<Ts...>{});
     }
 };
 
 } // namespace detail
 
-// QTask<void> is rejected up front: WhenAnyAwaitable would form `const
-// void &` deep inside its callbacks, which produces an impenetrable
-// diagnostic. void and heterogeneous (variant) support are planned.
+// Homogeneous value tasks: {index, value} of the winner.
 template<typename T, typename... Rest>
     requires(!std::is_void_v<T>) && (std::same_as<QTask<T>, std::remove_cvref_t<Rest>> && ...)
 auto whenAny(QTask<T> & first, Rest &... rest) {
     return detail::WhenAnyAwaitable<T, 1 + sizeof...(Rest)>{{&first, &rest...}};
+}
+
+// All-void tasks: the winner's index.
+template<std::same_as<QTask<void>>... Tasks>
+    requires(sizeof...(Tasks) > 0)
+auto whenAny(Tasks &... tasks) {
+    return detail::WhenAnyVoidAwaitable<sizeof...(Tasks)>{{&tasks...}};
+}
+
+// Mixed value types: std::variant<Ts...> with the winner at
+// variant::index(). An all-same pack selects the WhenAnyResult overload
+// above instead, which is friendlier to consume than variant<T, T>.
+template<typename First, typename... Rest>
+    requires(sizeof...(Rest) > 0) && (!std::is_void_v<First>) && ((!std::is_void_v<Rest>) && ...) &&
+            (!(std::same_as<First, Rest> && ...))
+auto whenAny(QTask<First> & first, QTask<Rest> &... rest) {
+    return detail::WhenAnyVariantAwaitable<First, Rest...>{{&first, &rest...}};
 }
 
 // ------------------------------------------------------------------

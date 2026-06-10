@@ -988,7 +988,7 @@ QtCoroutine::QTask<int> awaitOneArg34b(Emitter * e) {
     co_return co_await QtCoroutine::signal(e, &Emitter::oneArg);
 }
 
-QtCoroutine::QTask<int> whenAnyTest34(Emitter * e1, Emitter * e2) {
+QtCoroutine::QTask<QtCoroutine::WhenAnyResult<int>> whenAnyTest34(Emitter * e1, Emitter * e2) {
     auto t1 = awaitOneArg34a(e1);
     auto t2 = awaitOneArg34b(e2);
     co_return co_await QtCoroutine::whenAny(t1, t2);
@@ -1004,7 +1004,9 @@ void test_whenAny_first_wins(QCoreApplication & app) {
     QTimer::singleShot(10, [&]() { emit e2.oneArg(55); });
     QTimer::singleShot(50, [&]() {
         TEST_ASSERT(task.await_ready(), "whenAny should be done");
-        TEST_ASSERT(task.await_resume() == 55, "winning task result correct");
+        auto [index, value] = task.await_resume();
+        TEST_ASSERT(value == 55, "winning task result correct");
+        TEST_ASSERT(index == 1, "winner index is the argument position");
         app.quit();
     });
 
@@ -1022,7 +1024,9 @@ void test_whenAny_immediate() {
     auto t2 = taskReturns42();    // already done, 42
     auto awaitable = QtCoroutine::whenAny(t1, t2);
     TEST_ASSERT(awaitable.await_ready(), "whenAny should be immediately ready");
-    TEST_ASSERT(awaitable.await_resume() == 42, "result should be 42");
+    auto [index, value] = awaitable.await_resume();
+    TEST_ASSERT(value == 42, "result should be 42");
+    TEST_ASSERT(index == 0, "first already-done task wins the ready check");
 }
 
 // ====================================================================
@@ -2238,9 +2242,11 @@ void test_whenAny_awaiter_destroyed() {
 }
 
 // ====================================================================
-// 72. whenAny constraint rejects QTask<void> (regression: the old
-//     constraint admitted it and instantiation failed deep inside
-//     WhenAnyAwaitable with "forming reference to void")
+// 72. whenAny overload constraints: all-void and mixed value types are
+//     supported; void/value mixes are rejected at the constraint (the
+//     original regression: the old constraint admitted QTask<void> and
+//     instantiation failed deep inside WhenAnyAwaitable with "forming
+//     reference to void")
 // ====================================================================
 
 // Must be a template: only a dependent requires-expression turns the
@@ -2249,8 +2255,17 @@ template<typename T>
 constexpr bool whenAnyCompilesFor =
     requires(QtCoroutine::QTask<T> & a, QtCoroutine::QTask<T> & b) { QtCoroutine::whenAny(a, b); };
 
-static_assert(!whenAnyCompilesFor<void>, "whenAny must cleanly reject QTask<void>");
+static_assert(whenAnyCompilesFor<void>, "whenAny accepts all-void task packs");
 static_assert(whenAnyCompilesFor<int>, "whenAny accepts homogeneous non-void tasks");
+
+// Mixing void and value tasks stays cleanly rejected at the constraint.
+template<typename A, typename B>
+constexpr bool whenAnyCompilesForMixed =
+    requires(QtCoroutine::QTask<A> & a, QtCoroutine::QTask<B> & b) { QtCoroutine::whenAny(a, b); };
+
+static_assert(whenAnyCompilesForMixed<int, QString>, "whenAny accepts mixed value types (variant)");
+static_assert(!whenAnyCompilesForMixed<int, void>, "whenAny must cleanly reject void/value mixes");
+static_assert(!whenAnyCompilesForMixed<void, int>, "whenAny must cleanly reject void/value mixes");
 
 // ====================================================================
 // 73. Cross-thread sender: the coroutine resumes on the awaiting thread
@@ -2578,6 +2593,180 @@ void test_waitFor() {
     TEST_ASSERT(errCaught, "waitFor rethrows task errors");
 }
 
+// ====================================================================
+// 81. whenAny over QTask<void>: returns the winner's index; a winner
+//     that settled by cancellation rethrows
+// ====================================================================
+
+QtCoroutine::QTask<std::size_t> whenAnyVoid81(QtCoroutine::QTask<void> & a, QtCoroutine::QTask<void> & b) {
+    co_return co_await QtCoroutine::whenAny(a, b);
+}
+
+void test_whenAny_void_index() {
+    std::cout << "test_whenAny_void_index\n";
+
+    Emitter e1, e2;
+    auto t1 = waitVoid71(&e1);
+    auto t2 = waitVoid71(&e2);
+    auto winner = whenAnyVoid81(t1, t2);
+    TEST_ASSERT(!winner.await_ready(), "void whenAny should be suspended");
+
+    emit e2.voidSignal();
+
+    TEST_ASSERT(winner.await_ready(), "void whenAny settles on first completion");
+    TEST_ASSERT(winner.await_resume() == 1, "void whenAny returns the winner's index");
+}
+
+void test_whenAny_void_cancelled() {
+    std::cout << "test_whenAny_void_cancelled\n";
+
+    Emitter e;
+    std::stop_source ss;
+    auto t1 = awaitWithCancel(&e, ss.get_token());
+    auto t2 = waitVoid71(&e);
+    auto winner = whenAnyVoid81(t1, t2);
+    TEST_ASSERT(!winner.await_ready(), "should be suspended");
+
+    ss.request_stop(); // queued resume — waitFor pumps it
+
+    bool caught = false;
+    try {
+        QtCoroutine::waitFor(winner);
+    } catch (QtCoroutine::utils::AwaitCancelled & c) {
+        caught = c.reason == QtCoroutine::utils::AwaitCancelled::Stopped;
+    }
+    TEST_ASSERT(caught, "whenAny rethrows the winner's cancellation");
+}
+
+// ====================================================================
+// 82. whenAny over mixed value types: std::variant with the winner at
+//     variant::index(); a winner that settled by error rethrows
+// ====================================================================
+
+QtCoroutine::QTask<QString> waitTwoArgsMsg82(Emitter * e) {
+    auto [ok, msg] = co_await QtCoroutine::signal(e, &Emitter::twoArgs);
+    co_return msg;
+}
+
+QtCoroutine::QTask<std::variant<int, QString>> whenAnyVariant82(QtCoroutine::QTask<int> & a,
+                                                                QtCoroutine::QTask<QString> & b) {
+    co_return co_await QtCoroutine::whenAny(a, b);
+}
+
+void test_whenAny_variant() {
+    std::cout << "test_whenAny_variant\n";
+
+    // String task wins.
+    {
+        Emitter e1, e2;
+        auto t1 = waitOneArg71(&e1);
+        auto t2 = waitTwoArgsMsg82(&e2);
+        auto race = whenAnyVariant82(t1, t2);
+        TEST_ASSERT(!race.await_ready(), "variant whenAny should be suspended");
+
+        emit e2.twoArgs(true, "fast");
+
+        TEST_ASSERT(race.await_ready(), "variant whenAny settles");
+        auto v = race.await_resume();
+        TEST_ASSERT(v.index() == 1, "winner position via variant::index()");
+        TEST_ASSERT(std::get<1>(v) == "fast", "winner value held in the variant");
+    }
+
+    // Int task wins.
+    {
+        Emitter e1, e2;
+        auto t1 = waitOneArg71(&e1);
+        auto t2 = waitTwoArgsMsg82(&e2);
+        auto race = whenAnyVariant82(t1, t2);
+
+        emit e1.oneArg(99);
+
+        TEST_ASSERT(race.await_ready(), "variant whenAny settles");
+        auto v = race.await_resume();
+        TEST_ASSERT(v.index() == 0, "winner position via variant::index()");
+        TEST_ASSERT(std::get<0>(v) == 99, "winner value held in the variant");
+    }
+}
+
+QtCoroutine::QTask<int> failingInt82(Emitter * e) {
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal);
+    throw std::runtime_error("variant winner failed");
+}
+
+void test_whenAny_variant_error() {
+    std::cout << "test_whenAny_variant_error\n";
+
+    Emitter e1, e2;
+    auto t1 = failingInt82(&e1);
+    auto t2 = waitTwoArgsMsg82(&e2);
+    auto race = whenAnyVariant82(t1, t2);
+    TEST_ASSERT(!race.await_ready(), "should be suspended");
+
+    emit e1.voidSignal(); // t1 settles first — with an error
+
+    TEST_ASSERT(race.await_ready(), "settles on the failing winner");
+    bool caught = false;
+    try {
+        race.await_resume();
+    } catch (std::runtime_error & ex) {
+        caught = std::string(ex.what()) == "variant winner failed";
+    }
+    TEST_ASSERT(caught, "whenAny rethrows the winner's error");
+}
+
+// ====================================================================
+// 83. Destroyed-awaiter guards for the void and variant whenAny
+//     awaitables (mirrors test 71 for the homogeneous one)
+// ====================================================================
+
+QtCoroutine::QTask<void> whenAnyVoidWaiter83(QtCoroutine::QTask<void> & a, QtCoroutine::QTask<void> & b,
+                                             bool * reached) {
+    co_await QtCoroutine::whenAny(a, b);
+    *reached = true;
+}
+
+QtCoroutine::QTask<void> whenAnyVariantWaiter83(QtCoroutine::QTask<int> & a, QtCoroutine::QTask<QString> & b,
+                                                bool * reached) {
+    co_await QtCoroutine::whenAny(a, b);
+    *reached = true;
+}
+
+void test_whenAny_void_awaiter_destroyed() {
+    std::cout << "test_whenAny_void_awaiter_destroyed\n";
+
+    Emitter e1, e2;
+    auto t1 = waitVoid71(&e1);
+    auto t2 = waitVoid71(&e2);
+
+    bool reached = false;
+    {
+        auto waiter = whenAnyVoidWaiter83(t1, t2, &reached);
+        TEST_ASSERT(!waiter.await_ready(), "void whenAny waiter should be suspended");
+    }
+
+    emit e1.voidSignal(); // stale resume must be dropped
+
+    TEST_ASSERT(!reached, "destroyed void whenAny waiter must not resume");
+}
+
+void test_whenAny_variant_awaiter_destroyed() {
+    std::cout << "test_whenAny_variant_awaiter_destroyed\n";
+
+    Emitter e1, e2;
+    auto t1 = waitOneArg71(&e1);
+    auto t2 = waitTwoArgsMsg82(&e2);
+
+    bool reached = false;
+    {
+        auto waiter = whenAnyVariantWaiter83(t1, t2, &reached);
+        TEST_ASSERT(!waiter.await_ready(), "variant whenAny waiter should be suspended");
+    }
+
+    emit e1.oneArg(1); // stale resume must be dropped
+
+    TEST_ASSERT(!reached, "destroyed variant whenAny waiter must not resume");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2604,6 +2793,12 @@ int main(int argc, char * argv[]) {
     test_reassign_task_inside_callback();
     test_detach_inside_callback();
     test_waitFor();
+    test_whenAny_void_index();
+    test_whenAny_void_cancelled();
+    test_whenAny_variant();
+    test_whenAny_variant_error();
+    test_whenAny_void_awaiter_destroyed();
+    test_whenAny_variant_awaiter_destroyed();
 
     // Async tests (need event loop)
     test_signal_void(app);
