@@ -2252,6 +2252,172 @@ constexpr bool whenAnyCompilesFor =
 static_assert(!whenAnyCompilesFor<void>, "whenAny must cleanly reject QTask<void>");
 static_assert(whenAnyCompilesFor<int>, "whenAny accepts homogeneous non-void tasks");
 
+// ====================================================================
+// 73. Cross-thread sender: the coroutine resumes on the awaiting thread
+//     (regression: the default connection context used to be the sender,
+//     so the coroutine silently migrated to the sender's thread)
+// ====================================================================
+
+QtCoroutine::QTask<int> awaitOneArgRecordThread73(Emitter * e, QThread ** resumedOn) {
+    int v = co_await QtCoroutine::signal(e, &Emitter::oneArg);
+    *resumedOn = QThread::currentThread();
+    co_return v;
+}
+
+void test_cross_thread_sender_resumes_on_awaiting_thread(QCoreApplication & app) {
+    std::cout << "test_cross_thread_sender_resumes_on_awaiting_thread\n";
+
+    QThread worker;
+    worker.start();
+    Emitter e;
+    e.moveToThread(&worker);
+
+    QThread * resumedOn = nullptr;
+    auto task = awaitOneArgRecordThread73(&e, &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    // Emit from the worker thread.
+    QMetaObject::invokeMethod(&e, [&e]() { emit e.oneArg(42); }, Qt::QueuedConnection);
+
+    QTimer::singleShot(200, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "should resume after cross-thread emission");
+    if (task.await_ready()) {
+        TEST_ASSERT(task.await_resume() == 42, "signal value crosses threads");
+        TEST_ASSERT(resumedOn == QThread::currentThread(), "code after co_await stays on the awaiting thread");
+    }
+
+    worker.quit();
+    worker.wait();
+}
+
+// ====================================================================
+// 74. Cross-thread sender destroyed: cancellation delivered on the
+//     awaiting thread
+// ====================================================================
+
+QtCoroutine::QTask<void> awaitVoidRecordThread74(Emitter * e, QThread ** resumedOn) {
+    try {
+        co_await QtCoroutine::signal(e, &Emitter::voidSignal);
+    } catch (...) {
+        *resumedOn = QThread::currentThread();
+        throw;
+    }
+}
+
+void test_cross_thread_sender_destroyed(QCoreApplication & app) {
+    std::cout << "test_cross_thread_sender_destroyed\n";
+
+    QThread worker;
+    worker.start();
+    auto * e = new Emitter;
+    e->moveToThread(&worker);
+
+    QThread * resumedOn = nullptr;
+    auto task = awaitVoidRecordThread74(e, &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    QMetaObject::invokeMethod(e, [e]() { delete e; }, Qt::QueuedConnection); // delete on worker thread
+
+    QTimer::singleShot(200, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "should resume after cross-thread sender destruction");
+    if (task.await_ready()) {
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::SenderDestroyed,
+                    "reason should be SenderDestroyed");
+        TEST_ASSERT(resumedOn == QThread::currentThread(), "cancellation unwinds on the awaiting thread");
+    }
+
+    worker.quit();
+    worker.wait();
+}
+
+// ====================================================================
+// 75. Cross-thread sender + withTimeout: timeout fires on the awaiting
+//     thread (regression: the QTimer used to be torn down from the
+//     resume thread, which was unsupported cross-thread)
+// ====================================================================
+
+QtCoroutine::QTask<void> awaitWithTimeoutRecordThread75(Emitter * e, QThread ** resumedOn) {
+    try {
+        co_await QtCoroutine::signal(e, &Emitter::voidSignal).withTimeout(std::chrono::milliseconds(30));
+    } catch (...) {
+        *resumedOn = QThread::currentThread();
+        throw;
+    }
+}
+
+void test_cross_thread_sender_timeout(QCoreApplication & app) {
+    std::cout << "test_cross_thread_sender_timeout\n";
+
+    QThread worker;
+    worker.start();
+    Emitter e;
+    e.moveToThread(&worker); // never emits
+
+    QThread * resumedOn = nullptr;
+    auto task = awaitWithTimeoutRecordThread75(&e, &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    QTimer::singleShot(200, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "should resume after timeout");
+    if (task.await_ready()) {
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::utils::AwaitCancelled::Timeout, "reason should be Timeout");
+        TEST_ASSERT(resumedOn == QThread::currentThread(), "timeout unwinds on the awaiting thread");
+    }
+
+    worker.quit();
+    worker.wait();
+}
+
+// ====================================================================
+// 76. resumeOn(ctx) migrates the continuation to ctx's thread — the
+//     explicit opt-in counterpart of test 73. Result observed via the
+//     toFuture() bridge (the sanctioned cross-thread consumption path).
+// ====================================================================
+
+QtCoroutine::QTask<void> migrateToCtx76(Emitter * e, QObject * ctx, QThread ** resumedOn) {
+    co_await QtCoroutine::signal(e, &Emitter::voidSignal).resumeOn(ctx);
+    *resumedOn = QThread::currentThread();
+}
+
+void test_resumeOn_migrates_to_ctx_thread(QCoreApplication & app) {
+    std::cout << "test_resumeOn_migrates_to_ctx_thread\n";
+
+    QThread worker;
+    worker.start();
+    while (!worker.eventDispatcher()) // resumeOn requires a live dispatcher on ctx's thread
+        QThread::msleep(1);
+
+    Emitter e; // sender stays on the main thread
+    QObject ctx;
+    ctx.moveToThread(&worker);
+
+    QThread * resumedOn = nullptr;
+    auto task = migrateToCtx76(&e, &ctx, &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    // Bridge completion back to the main thread before emitting.
+    auto future = task.toFuture();
+    future.then(&app, [&]() { app.quit(); });
+
+    emit e.voidSignal(); // main-thread emit, queued to ctx's (worker) thread
+
+    QTimer::singleShot(500, [&]() { app.quit(); }); // watchdog
+    app.exec();
+
+    TEST_ASSERT(resumedOn == &worker, "code after co_await runs on the resumeOn ctx's thread");
+
+    worker.quit();
+    worker.wait();
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2335,6 +2501,10 @@ int main(int argc, char * argv[]) {
     test_stop_then_destroy_before_resume(app);
     test_sleep_destroyed_while_suspended(app);
     test_withTimeout_readyIf_order(app);
+    test_cross_thread_sender_resumes_on_awaiting_thread(app);
+    test_cross_thread_sender_destroyed(app);
+    test_cross_thread_sender_timeout(app);
+    test_resumeOn_migrates_to_ctx_thread(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;

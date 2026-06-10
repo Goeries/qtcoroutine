@@ -7,10 +7,10 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <QMutex>
 #include <QObject>
 #include <QThread>
 #include <QTimer>
-#include <QException>
 #include <stop_token>
 #include "utils.hpp"
 
@@ -69,6 +69,15 @@ private:
 // QSignalAwaitable – awaitable + builder for co_await-ing Qt signals
 // ------------------------------------------------------------------
 
+// Thread semantics (mirrors QObject::connect's AutoConnection default —
+// the suspended coroutine is the receiver, resuming it is the slot):
+//  - By default the coroutine resumes on the thread it suspended on,
+//    regardless of which thread the sender lives on or emits from. Code
+//    after the co_await runs on the same thread as the code before it.
+//    A same-thread emission resumes synchronously inside the emit, exactly
+//    like a direct-connected slot.
+//  - .resumeOn(ctx) explicitly migrates: delivery and everything after the
+//    co_await run on ctx's thread.
 template<typename Sender, typename Signal, typename ReadyCheck = std::nullptr_t>
     requires std::derived_from<Sender, QObject>
 class QSignalAwaitable {
@@ -76,16 +85,57 @@ class QSignalAwaitable {
     using Tuple = typename Args::tuple_type;
     using StopCallback = std::stop_callback<std::function<void()>>;
 
+    // Everything the resume callbacks touch lives here, on the heap, shared
+    // between the awaitable and the callbacks. Callbacks never touch the
+    // awaitable: with resumeOn() to another thread, a signal can fire — and
+    // run the coroutine to completion, destroying this awaitable — while
+    // await_suspend is still executing on the awaiting thread.
+    struct ControlBlock {
+        // Exactly-one-resume gate; also set by ~QSignalAwaitable so stale
+        // queued resumes are dropped after the frame is destroyed.
+        std::atomic<bool> resumed{false};
+        std::optional<Tuple> result;
+        std::optional<utils::AwaitCancelled::Reason> cancelReason;
+        // Default resume context, created on the awaiting thread. shared_ptr
+        // so queued resumes keep it alive until delivered.
+        std::shared_ptr<QObject> defaultCtx;
+
+        // Teardown state. Mutex-guarded: await_suspend writes these on the
+        // awaiting thread while (with resumeOn) the destructor may already
+        // be disarming on the resume thread.
+        QMutex armMutex;
+        QMetaObject::Connection signalConnection;
+        QMetaObject::Connection senderDestroyedConnection;
+        QMetaObject::Connection resumeCtxDestroyedConnection;
+        std::unique_ptr<StopCallback> stopCallback;
+
+        // Thread-safe: disconnect(Connection) may be called from any thread,
+        // and ~stop_callback waits out a concurrently-running callback.
+        void disarm() {
+            QMutexLocker lock(&armMutex);
+            QObject::disconnect(signalConnection);
+            QObject::disconnect(senderDestroyedConnection);
+            QObject::disconnect(resumeCtxDestroyedConnection);
+            stopCallback.reset();
+        }
+    };
+
 public:
     QSignalAwaitable(Sender * sender, Signal signal)
         : m_sender(sender),
           m_signal(signal) {}
 
-    // Destructor disconnects any active Qt connections. Ensures that if
-    // the coroutine frame is destroyed while suspended (e.g. task goes out
-    // of scope), signal callbacks don't fire into dead memory.
+    // Marks any in-flight resume stale, then tears down connections and the
+    // stop callback. Ensures that if the coroutine frame is destroyed while
+    // suspended (e.g. task goes out of scope), no callback or queued resume
+    // fires into dead memory. Callbacks themselves never disarm — only this
+    // destructor does — so a resume racing await_suspend never touches
+    // connection state concurrently.
     ~QSignalAwaitable() {
-        cleanup();
+        if (m_cb) {
+            m_cb->resumed.store(true, std::memory_order_release);
+            m_cb->disarm();
+        }
     }
 
     QSignalAwaitable(const QSignalAwaitable &) = delete;
@@ -127,7 +177,7 @@ public:
         if (m_stop.stop_requested()) {
             // Mark cancelled here: await_suspend never runs on the ready
             // path, so the stop-callback that normally sets this is skipped.
-            m_cancelled = true;
+            m_cb->cancelReason = utils::AwaitCancelled::Stopped;
             return true;
         }
 
@@ -137,7 +187,7 @@ public:
                 return static_cast<bool>(checkResult);
             } else {
                 if (checkResult) {
-                    m_result.emplace(std::move(*checkResult));
+                    m_cb->result.emplace(std::move(*checkResult));
                     return true;
                 }
             }
@@ -150,115 +200,112 @@ public:
         Q_ASSERT_X(QThread::currentThread()->eventDispatcher(), "co_await QSignalAwaitable",
                    "co_await requires a running event loop on the co_await thread");
 
-        QObject * ctx = m_resumeCtx ? m_resumeCtx : m_sender;
+        // The connection context determines the resume thread. Default: a
+        // fresh QObject on the awaiting thread, so cross-thread emissions
+        // marshal here and the coroutine never silently migrates (the
+        // coroutine is the receiver — same rule as QObject::connect).
+        QObject * ctx;
+        if (m_resumeCtx) {
+            Q_ASSERT_X(m_resumeCtx->thread()->eventDispatcher(), "co_await QSignalAwaitable",
+                       "co_await requires a running event loop on the resumeOn() thread");
+            ctx = m_resumeCtx;
+        } else {
+            m_cb->defaultCtx = std::make_shared<QObject>();
+            ctx = m_cb->defaultCtx.get();
+        }
 
-        Q_ASSERT_X(ctx->thread()->eventDispatcher(), "co_await QSignalAwaitable",
-                   "co_await requires a running event loop on the resuming thread");
+        // Callbacks capture the control block, never `this` (see ControlBlock
+        // doc). They do not disarm; the awaitable's destructor does, right
+        // after resume (end of the co_await full-expression) or when the
+        // frame is destroyed while suspended. Stale fires in that window are
+        // dropped by the `resumed` gate.
+        auto cb = m_cb;
 
-        // Guard: multiple callbacks could fire near-simultaneously across
-        // threads. Atomic exchange ensures exactly one calls handle.resume().
-        // Stored as a member so cleanup()/the destructor can mark in-flight
-        // resumes stale — see cleanup().
-        m_guard = std::make_shared<std::atomic<bool>>(false);
-        auto guard = m_guard;
+        QMutexLocker arming(&cb->armMutex);
 
-        // If signal fires, resume coroutine
-        m_signalConnection = QObject::connect(m_sender, m_signal, ctx, [this, handle, guard](auto &&... args) mutable {
-            if (guard->exchange(true, std::memory_order_acq_rel))
-                return;
-            cleanup();
-            m_result.emplace(std::forward<decltype(args)>(args)...);
-            handle.resume();
-        });
-
-        // If sender goes out of scope first, clean up coroutine.
-        // Using ctx ensures delivery on the correct thread when
-        // resumeCtx lives on a different thread than sender.
-        m_senderDestroyedConnection =
-            QObject::connect(m_sender, &QObject::destroyed, ctx, [this, handle, guard]() mutable {
-                if (guard->exchange(true, std::memory_order_acq_rel))
-                    return;
-                cleanup();
-                m_senderDestroyed = true;
-                handle.resume();
-            });
-
-        // If resumeContext goes out of scope first, clean up coroutine
+        // If resumeContext goes out of scope first, cancel the await.
+        // No context argument: runs directly on ctx's thread, where the
+        // destroyed signal is emitted.
         if (m_resumeCtx)
-            m_resumeContextDestroyedConnection =
-                QObject::connect(m_resumeCtx, &QObject::destroyed, [this, handle, guard]() mutable {
-                    if (guard->exchange(true, std::memory_order_acq_rel))
+            cb->resumeCtxDestroyedConnection =
+                QObject::connect(m_resumeCtx, &QObject::destroyed, [cb, handle]() mutable {
+                    if (cb->resumed.exchange(true, std::memory_order_acq_rel))
                         return;
-                    cleanup();
-                    m_resumeContextDestroyed = true;
+                    cb->cancelReason = utils::AwaitCancelled::ResumeContextDestroyed;
                     handle.resume();
                 });
 
-        // If coroutine cancelled first, clean up coroutine
+        // If sender goes out of scope first, cancel the await (delivered on
+        // ctx's thread).
+        cb->senderDestroyedConnection = QObject::connect(m_sender, &QObject::destroyed, ctx, [cb, handle]() mutable {
+            if (cb->resumed.exchange(true, std::memory_order_acq_rel))
+                return;
+            cb->cancelReason = utils::AwaitCancelled::SenderDestroyed;
+            handle.resume();
+        });
+
+        // If the stop token triggers, cancel the await. request_stop() may
+        // run this on any thread; the resume is marshalled to ctx's thread.
+        // Capturing cb keeps defaultCtx alive until the queued call lands.
         if (m_stop.stop_possible()) {
-            m_stopCallback = std::make_unique<StopCallback>(m_stop, [this, handle, ctx, guard]() mutable {
-                // Early check: skip invokeMethod if another callback already
-                // won the race, avoiding a call on a potentially-destroyed ctx.
-                if (guard->load(std::memory_order_acquire))
+            cb->stopCallback = std::make_unique<StopCallback>(m_stop, [cb, handle, ctx]() mutable {
+                // Early check (the authoritative one runs at delivery): skip
+                // posting once another path already resumed, avoiding a call
+                // on a potentially-destroyed resumeOn() ctx.
+                if (cb->resumed.load(std::memory_order_acquire))
                     return;
                 QMetaObject::invokeMethod(
                     ctx,
-                    [this, handle, guard]() mutable {
-                        if (guard->exchange(true, std::memory_order_acq_rel))
+                    [cb, handle]() mutable {
+                        if (cb->resumed.exchange(true, std::memory_order_acq_rel))
                             return;
-                        cleanup();
-                        m_cancelled = true;
+                        cb->cancelReason = utils::AwaitCancelled::Stopped;
                         handle.resume();
                     },
                     Qt::QueuedConnection);
             });
         }
 
-        // If timeout specified, start timer
+        // If timeout specified, arm a single-shot fire on ctx's thread.
+        // Nothing to stop or destroy: a stale fire is dropped by the gate
+        // and merely keeps cb alive until expiry.
         if (m_timeout) {
-            m_timeoutTimer = std::make_unique<QTimer>();
-            m_timeoutTimer->setSingleShot(true);
-            QObject::connect(m_timeoutTimer.get(), &QTimer::timeout, ctx, [this, handle, guard]() mutable {
-                if (guard->exchange(true, std::memory_order_acq_rel))
+            QTimer::singleShot(*m_timeout, ctx, [cb, handle]() mutable {
+                if (cb->resumed.exchange(true, std::memory_order_acq_rel))
                     return;
-                cleanup();
-                m_timedOut = true;
+                cb->cancelReason = utils::AwaitCancelled::Timeout;
                 handle.resume();
             });
-            m_timeoutTimer->start(static_cast<int>(m_timeout->count()));
         }
+
+        // Armed last: from this point the signal can fire (and, with
+        // resumeOn, resume the coroutine on another thread) at any moment.
+        cb->signalConnection = QObject::connect(m_sender, m_signal, ctx, [cb, handle](auto &&... args) mutable {
+            if (cb->resumed.exchange(true, std::memory_order_acq_rel))
+                return;
+            cb->result.emplace(std::forward<decltype(args)>(args)...);
+            handle.resume();
+        });
     }
 
     void await_resume()
         requires(Args::count == 0)
     {
-        if (m_cancelled)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::Stopped};
-        else if (m_timedOut)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::Timeout};
-        else if (m_senderDestroyed)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::SenderDestroyed};
-        else if (m_resumeContextDestroyed)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::ResumeContextDestroyed};
+        if (m_cb->cancelReason)
+            throw utils::AwaitCancelled{*m_cb->cancelReason};
     }
 
     [[nodiscard("co_await result contains signal args")]]
     utils::ConnectResultT<Signal> await_resume()
         requires(Args::count > 0)
     {
-        if (m_cancelled)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::Stopped};
-        else if (m_timedOut)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::Timeout};
-        else if (m_senderDestroyed)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::SenderDestroyed};
-        else if (m_resumeContextDestroyed)
-            throw utils::AwaitCancelled{utils::AwaitCancelled::ResumeContextDestroyed};
+        if (m_cb->cancelReason)
+            throw utils::AwaitCancelled{*m_cb->cancelReason};
 
         if constexpr (Args::count == 1)
-            return std::get<0>(std::move(*m_result));
+            return std::get<0>(std::move(*m_cb->result));
         else
-            return std::move(*m_result);
+            return std::move(*m_cb->result);
     }
 
 private:
@@ -279,40 +326,13 @@ private:
           m_ready(std::move(ready)),
           m_timeout(timeout) {}
 
-    void cleanup() {
-        // Mark any in-flight resume as stale. The stop-token path posts its
-        // resume via QMetaObject::invokeMethod (QueuedConnection); unlike the
-        // connections below, a posted call cannot be disconnected and would
-        // fire into freed memory if the coroutine frame is destroyed between
-        // request_stop() and delivery.
-        if (m_guard)
-            m_guard->store(true, std::memory_order_release);
-        QObject::disconnect(m_signalConnection);
-        QObject::disconnect(m_senderDestroyedConnection);
-        QObject::disconnect(m_resumeContextDestroyedConnection);
-        m_stopCallback.reset();
-        if (m_timeoutTimer)
-            m_timeoutTimer->stop();
-    }
-
     Sender * m_sender;
     Signal m_signal;
     QObject * m_resumeCtx = nullptr;
     std::stop_token m_stop;
     [[no_unique_address]] ReadyCheck m_ready;
-
-    std::optional<Tuple> m_result;
-    QMetaObject::Connection m_signalConnection;
-    QMetaObject::Connection m_senderDestroyedConnection;
-    QMetaObject::Connection m_resumeContextDestroyedConnection;
-    std::unique_ptr<StopCallback> m_stopCallback;
     std::optional<std::chrono::milliseconds> m_timeout;
-    std::unique_ptr<QTimer> m_timeoutTimer;
-    std::shared_ptr<std::atomic<bool>> m_guard;
-    bool m_cancelled = false;
-    bool m_timedOut = false;
-    bool m_senderDestroyed = false;
-    bool m_resumeContextDestroyed = false;
+    std::shared_ptr<ControlBlock> m_cb = std::make_shared<ControlBlock>();
 };
 
 // ------------------------------------------------------------------
