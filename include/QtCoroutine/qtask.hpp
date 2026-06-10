@@ -21,6 +21,9 @@
 
 namespace QtCoroutine {
 
+template<typename T>
+class QTask;
+
 namespace detail {
 
 // Completion dispatch, run from final_suspend's awaiter while the coroutine
@@ -64,179 +67,184 @@ inline std::coroutine_handle<> dispatchCompletion(std::coroutine_handle<Promise>
     }
 }
 
-} // namespace detail
+enum class TaskState { empty, value, cancelled, error };
 
-// QTask<T> owns the coroutine frame — the destructor destroys it.
-// Callbacks registered via .then()/.onCancelled()/.onError() fire during
-// completion dispatch at final_suspend, with the coroutine suspended, so a
-// callback may destroy or reassign its own task (e.g. `m_task = next();`
-// inside m_task's .then()) — frame destruction is deferred, like
-// QObject::deleteLater() called from a slot. Note that after destroying the
-// task inside a value callback, the callback's reference argument is no
-// longer valid. The frame must survive until completion. A common footgun:
-//
-//     someAsyncOp().then(cb);   // cb never fires — wrapper dies at ';'
-//
-// Two lifetime models avoid this:
-//  1. co_await the task — the caller's coroutine frame keeps this one
-//     alive across the suspension; no detach needed.
-//  2. Fire-and-forget — register callbacks, then call .detach() to hand
-//     ownership to the coroutine itself. The frame self-destructs after
-//     final_suspend. Mirrors std::jthread::detach() semantics.
-//
-//         auto task = someAsyncOp();
-//         task.then(cb);
-//         task.detach();
-//
-// .detach() is not thread-safe (single-owner semantics).
-//
-// co_await stores the awaiting coroutine's handle in this task's promise.
-// At most one coroutine may await a given task (asserted in debug builds),
-// and an awaited task must not outlive its awaiter: if the awaiting frame
-// is destroyed while suspended, the task's completion would resume the
-// destroyed frame. whenAll/whenAny guard against this internally; a plain
-// co_await on a task you don't own cannot.
-//
-// Threading contract: a QTask belongs to the thread that created it. While
-// the task is live, owner-side operations — co_await, then/onCancelled/
-// onError, toFuture, detach, destruction — must happen on that thread
-// (debug-asserted). Once settled, querying and destroying are safe from any
-// thread that has synchronized with the completion. Inputs are always
-// unrestricted: signals may be emitted, futures completed, and
-// request_stop() called from any thread — the awaitables marshal the resume
-// back to the right thread. After .resumeOn(ctx) migrates a coroutine to
-// another thread, the original thread must treat the handle as foreign
-// until settled (bridge results with toFuture()).
+// final_suspend awaiter: runs the completion dispatch with the coroutine
+// already suspended. Namespace-scope (not local to final_suspend) because
+// await_suspend must be a template to receive the derived promise's typed
+// handle, and local classes cannot have member templates.
+struct FinalAwaiter {
+    bool await_ready() noexcept {
+        return false;
+    }
+    template<typename Promise>
+    std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
+        return dispatchCompletion(h);
+    }
+    void await_resume() noexcept {}
+};
+
+// State and behavior shared by the QTask<T> and QTask<void> promises. The
+// value-shaped pieces — result storage, return_value/return_void, the
+// then-callback signature — live in TaskPromise<T> / TaskPromise<void>.
+struct TaskPromiseBase {
+    // Eager start: the coroutine runs to its first suspension point
+    // immediately, so the frame is live before .then() is called.
+    std::suspend_never initial_suspend() noexcept {
+        return {};
+    }
+
+    // Completion dispatch (callbacks, settled flag, self-destruct or
+    // symmetric transfer) happens in FinalAwaiter, where the coroutine is
+    // already suspended — see dispatchCompletion.
+    FinalAwaiter final_suspend() noexcept {
+        return {};
+    }
+
+    void unhandled_exception() {
+        QMutexLocker lock(&mutex);
+        try {
+            throw;
+        } catch (QtCoroutine::utils::AwaitCancelled & c) {
+            // Cancellation is not an error, it's a state
+            cancelReason = c.reason;
+            state = TaskState::cancelled;
+        } catch (...) {
+            // Real errors propagate normally
+            exception = std::current_exception();
+            state = TaskState::error;
+        }
+    }
+
+    std::exception_ptr exception;
+    QtCoroutine::utils::AwaitCancelled::Reason cancelReason{};
+    TaskState state = TaskState::empty;
+    std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
+    std::function<void(std::exception_ptr)> errorCallback;
+    std::coroutine_handle<> continuation;
+    bool detached = false;
+    // Synchronizes state/result/callbacks/continuation against
+    // cross-thread completion (e.g. after a resumeOn migration).
+    mutable QMutex mutex;
+    // Heap-shared so the QTask handle can still read it after a callback
+    // destroyed the frame; true once completion dispatch has finished.
+    std::shared_ptr<std::atomic<bool>> settled = std::make_shared<std::atomic<bool>>(false);
+    // Creation thread; owner ops on a live task are asserted against it.
+    QThread * ownerThread = QThread::currentThread();
+};
+
 template<typename T>
-class QTask {
+struct TaskPromise : TaskPromiseBase {
+    QTask<T> get_return_object();
 
-    enum class State { empty, value, cancelled, error };
+    // NOTE: TaskPromise<T> only provides return_value(), not return_void().
+    // The C++ standard forbids having both on the same promise type.
+    // This means co_return; (no operand) won't compile for non-void T.
+    // For types like std::expected<void, E>, use co_return {} instead
+    // of co_return; to default-construct the success value.
+    //
+    // return_value/unhandled_exception only record the outcome; callback
+    // dispatch happens at final_suspend.
+    void return_value(const T & val) {
+        QMutexLocker lock(&mutex);
+        result.emplace(val);
+        state = TaskState::value;
+    }
 
-public:
-    struct promise_type {
-        QTask get_return_object() {
-            return QTask{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
+    void return_value(T && val) {
+        QMutexLocker lock(&mutex);
+        result.emplace(std::move(val));
+        state = TaskState::value;
+    }
 
-        // Eager start: coroutine runs to first suspension point immediately.
-        // This ensures the coroutine frame is live before .then() is called.
-        std::suspend_never initial_suspend() noexcept {
-            return {};
-        }
-
-        // Completion dispatch (callbacks, settled flag, self-destruct or
-        // symmetric transfer) happens in the awaiter, where the coroutine is
-        // already suspended — see detail::dispatchCompletion.
-        auto final_suspend() noexcept {
-
-            struct Awaiter {
-                bool await_ready() noexcept {
-                    return false;
-                }
-                std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
-                    return detail::dispatchCompletion(h);
-                }
-                void await_resume() noexcept {}
-            };
-
-            return Awaiter{};
-        }
-
-        // NOTE: QTask<T> only provides return_value(), not return_void().
-        // The C++ standard forbids having both on the same promise type.
-        // This means co_return; (no operand) won't compile for non-void T.
-        // For types like std::expected<void, E>, use co_return {} instead
-        // of co_return; to default-construct the success value.
-        //
-        // return_value/unhandled_exception only record the outcome; callback
-        // dispatch happens at final_suspend.
-        void return_value(const T & val) {
-            QMutexLocker lock(&mutex);
-            result.emplace(val);
-            state = State::value;
-        }
-
-        void return_value(T && val) {
-            QMutexLocker lock(&mutex);
-            result.emplace(std::move(val));
-            state = State::value;
-        }
-
-        void unhandled_exception() {
-            QMutexLocker lock(&mutex);
-            try {
-                throw;
-            } catch (QtCoroutine::utils::AwaitCancelled & c) {
-                // Cancellation is not an error, it's a state
-                cancelReason = c.reason;
-                state = State::cancelled;
-            } catch (...) {
-                // Real errors propagate normally
-                exception = std::current_exception();
-                state = State::error;
+    // Called by dispatchCompletion with the coroutine suspended and the
+    // mutex NOT held. state/result are stable — completion has already
+    // been recorded. User-callback exceptions are swallowed (final_suspend
+    // is noexcept).
+    template<typename ThenFn, typename CancelFn, typename ErrorFn>
+    void invokeCallbacks(ThenFn & then, CancelFn & cancelled, ErrorFn & error) noexcept {
+        try {
+            switch (state) {
+            case TaskState::value:
+                if (then)
+                    then(*result);
+                break;
+            case TaskState::cancelled:
+                if (cancelled)
+                    cancelled(QtCoroutine::utils::AwaitCancelled{cancelReason});
+                break;
+            case TaskState::error:
+                if (error)
+                    error(exception);
+                break;
+            default:
+                break;
             }
-        }
+        } catch (...) {}
+    }
 
-        // Called by detail::dispatchCompletion with the coroutine suspended
-        // and the mutex NOT held. state/result are stable — completion has
-        // already been recorded. User-callback exceptions are swallowed
-        // (final_suspend is noexcept).
-        template<typename ThenFn, typename CancelFn, typename ErrorFn>
-        void invokeCallbacks(ThenFn & then, CancelFn & cancelled, ErrorFn & error) noexcept {
-            try {
-                switch (state) {
-                case State::value:
-                    if (then)
-                        then(*result);
-                    break;
-                case State::cancelled:
-                    if (cancelled)
-                        cancelled(QtCoroutine::utils::AwaitCancelled{cancelReason});
-                    break;
-                case State::error:
-                    if (error)
-                        error(exception);
-                    break;
-                default:
-                    break;
-                }
-            } catch (...) {}
-        }
+    std::optional<T> result;
+    std::function<void(const T &)> thenCallback;
+};
 
-        std::optional<T> result;
-        std::exception_ptr exception;
-        QtCoroutine::utils::AwaitCancelled::Reason cancelReason{};
-        State state = State::empty;
-        std::function<void(const T &)> thenCallback;
-        std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
-        std::function<void(std::exception_ptr)> errorCallback;
-        std::coroutine_handle<> continuation;
-        bool detached = false;
-        // Synchronizes state/result/callbacks/continuation against
-        // cross-thread completion (e.g. after a resumeOn migration).
-        mutable QMutex mutex;
-        // Heap-shared so the QTask handle can still read it after a callback
-        // destroyed the frame; true once completion dispatch has finished.
-        std::shared_ptr<std::atomic<bool>> settled = std::make_shared<std::atomic<bool>>(false);
-        // Creation thread; owner ops on a live task are asserted against it.
-        QThread * ownerThread = QThread::currentThread();
-    };
+template<>
+struct TaskPromise<void> : TaskPromiseBase {
+    QTask<void> get_return_object();
 
-    explicit QTask(std::coroutine_handle<promise_type> handle)
+    void return_void() noexcept {
+        QMutexLocker lock(&mutex);
+        state = TaskState::value;
+    }
+
+    // See TaskPromise<T>::invokeCallbacks.
+    template<typename ThenFn, typename CancelFn, typename ErrorFn>
+    void invokeCallbacks(ThenFn & then, CancelFn & cancelled, ErrorFn & error) noexcept {
+        try {
+            switch (state) {
+            case TaskState::value:
+                if (then)
+                    then();
+                break;
+            case TaskState::cancelled:
+                if (cancelled)
+                    cancelled(QtCoroutine::utils::AwaitCancelled{cancelReason});
+                break;
+            case TaskState::error:
+                if (error)
+                    error(exception);
+                break;
+            default:
+                break;
+            }
+        } catch (...) {}
+    }
+
+    std::function<void()> thenCallback;
+};
+
+// Everything QTask<T> and QTask<void> share on the handle side: ownership
+// and disposal, move semantics, awaiting, state queries, detach, and the
+// cancellation/error callbacks. The value-shaped surface — then(),
+// await_resume(), toFuture() — lives in the derived classes.
+template<typename Promise>
+class TaskBase {
+public:
+    explicit TaskBase(std::coroutine_handle<Promise> handle)
         : m_handle(handle),
           m_settled(handle.promise().settled) {}
 
-    ~QTask() {
+    ~TaskBase() {
         disposeHandle();
     }
 
-    QTask(const QTask &) = delete;
+    TaskBase(const TaskBase &) = delete;
+    TaskBase & operator=(const TaskBase &) = delete;
 
-    QTask(QTask && other) noexcept
+    TaskBase(TaskBase && other) noexcept
         : m_handle(std::exchange(other.m_handle, nullptr)),
           m_settled(std::move(other.m_settled)) {}
 
-    QTask & operator=(QTask && other) noexcept {
+    TaskBase & operator=(TaskBase && other) noexcept {
         if (this != &other) {
             disposeHandle();
             m_handle = std::exchange(other.m_handle, nullptr);
@@ -245,7 +253,7 @@ public:
         return *this;
     }
 
-    // See class doc for the fire-and-forget lifetime pattern.
+    // See the QTask<T> class doc for the fire-and-forget lifetime pattern.
     void detach() {
         if (!m_handle)
             return;
@@ -292,31 +300,13 @@ public:
     bool isCancelled() const {
         Q_ASSERT_X(m_handle, "QTask::isCancelled", "no coroutine attached (moved-from or detached task)");
         QMutexLocker lock(&m_handle.promise().mutex);
-        return m_handle.promise().state == State::cancelled;
+        return m_handle.promise().state == TaskState::cancelled;
     }
 
     QtCoroutine::utils::AwaitCancelled::Reason cancelReason() const {
         Q_ASSERT_X(m_handle, "QTask::cancelReason", "no coroutine attached (moved-from or detached task)");
         QMutexLocker lock(&m_handle.promise().mutex);
         return m_handle.promise().cancelReason;
-    }
-
-    template<typename F>
-    void then(F && callback) {
-        Q_ASSERT_X(m_handle, "QTask::then", "no coroutine attached (moved-from or detached task)");
-        auto & p = m_handle.promise();
-        Q_ASSERT_X(m_settled->load(std::memory_order_acquire) || QThread::currentThread() == p.ownerThread,
-                   "QTask::then", "register callbacks on a live task only from its owning thread");
-        {
-            QMutexLocker lock(&p.mutex);
-            if (!m_settled->load(std::memory_order_acquire)) {
-                p.thenCallback = std::forward<F>(callback);
-                return; // pending — the completion dispatch will invoke it
-            }
-        }
-        // Settled: dispatch has finished and state is immutable.
-        if (p.state == State::value)
-            callback(*p.result);
     }
 
     template<typename F>
@@ -332,7 +322,7 @@ public:
                 return;
             }
         }
-        if (p.state == State::cancelled)
+        if (p.state == TaskState::cancelled)
             callback(QtCoroutine::utils::AwaitCancelled{p.cancelReason});
     }
 
@@ -349,51 +339,11 @@ public:
                 return;
             }
         }
-        if (p.state == State::error)
+        if (p.state == TaskState::error)
             callback(p.exception);
     }
 
-    // Bridge to QFuture — allows use with QFutureWatcher, QtFuture::whenAll, etc.
-    // Consumes the .then/.onCancelled/.onError callbacks; use QFuture's
-    // continuation API after calling this.
-    QFuture<T> toFuture() {
-        auto qpromise = std::make_shared<QPromise<T>>();
-        qpromise->start();
-
-        then([qpromise](const T & val) {
-            qpromise->addResult(val);
-            qpromise->finish();
-        });
-
-        onCancelled([qpromise](const QtCoroutine::utils::AwaitCancelled & c) {
-            qpromise->setException(std::make_exception_ptr(c));
-            qpromise->finish();
-        });
-
-        onError([qpromise](std::exception_ptr ep) {
-            qpromise->setException(ep);
-            qpromise->finish();
-        });
-
-        return qpromise->future();
-    }
-
-    T await_resume() {
-        auto & p = m_handle.promise();
-        QMutexLocker lock(&p.mutex);
-        switch (p.state) {
-        case State::value:
-            return std::move(*p.result);
-        case State::cancelled:
-            throw QtCoroutine::utils::AwaitCancelled{p.cancelReason};
-        case State::error:
-            std::rethrow_exception(p.exception);
-        default:
-            std::unreachable();
-        }
-    }
-
-private:
+protected:
     // Single disposal path for the destructor and move-assignment.
     void disposeHandle() {
         if (!m_handle)
@@ -419,179 +369,62 @@ private:
         m_handle = {};
     }
 
-    std::coroutine_handle<promise_type> m_handle;
+    std::coroutine_handle<Promise> m_handle;
     std::shared_ptr<std::atomic<bool>> m_settled;
 };
 
-// QTask<void> specialization
-template<>
-class QTask<void> {
-    enum class State { empty, value, cancelled, error };
+} // namespace detail
+
+// QTask<T> owns the coroutine frame — the destructor destroys it.
+// Callbacks registered via .then()/.onCancelled()/.onError() fire during
+// completion dispatch at final_suspend, with the coroutine suspended, so a
+// callback may destroy or reassign its own task (e.g. `m_task = next();`
+// inside m_task's .then()) — frame destruction is deferred, like
+// QObject::deleteLater() called from a slot. Note that after destroying the
+// task inside a value callback, the callback's reference argument is no
+// longer valid. The frame must survive until completion. A common footgun:
+//
+//     someAsyncOp().then(cb);   // cb never fires — wrapper dies at ';'
+//
+// Two lifetime models avoid this:
+//  1. co_await the task — the caller's coroutine frame keeps this one
+//     alive across the suspension; no detach needed.
+//  2. Fire-and-forget — register callbacks, then call .detach() to hand
+//     ownership to the coroutine itself. The frame self-destructs after
+//     final_suspend. Mirrors std::jthread::detach() semantics.
+//
+//         auto task = someAsyncOp();
+//         task.then(cb);
+//         task.detach();
+//
+// .detach() is not thread-safe (single-owner semantics).
+//
+// co_await stores the awaiting coroutine's handle in this task's promise.
+// At most one coroutine may await a given task (asserted in debug builds),
+// and an awaited task must not outlive its awaiter: if the awaiting frame
+// is destroyed while suspended, the task's completion would resume the
+// destroyed frame. whenAll/whenAny guard against this internally; a plain
+// co_await on a task you don't own cannot.
+//
+// Threading contract: a QTask belongs to the thread that created it. While
+// the task is live, owner-side operations — co_await, then/onCancelled/
+// onError, toFuture, detach, destruction — must happen on that thread
+// (debug-asserted). Once settled, querying and destroying are safe from any
+// thread that has synchronized with the completion. Inputs are always
+// unrestricted: signals may be emitted, futures completed, and
+// request_stop() called from any thread — the awaitables marshal the resume
+// back to the right thread. After .resumeOn(ctx) migrates a coroutine to
+// another thread, the original thread must treat the handle as foreign
+// until settled (bridge results with toFuture()).
+template<typename T>
+class QTask : public detail::TaskBase<detail::TaskPromise<T>> {
+    using Base = detail::TaskBase<detail::TaskPromise<T>>;
+    using Base::m_handle;
+    using Base::m_settled;
 
 public:
-    struct promise_type {
-        QTask get_return_object() {
-            return QTask{std::coroutine_handle<promise_type>::from_promise(*this)};
-        }
-
-        std::suspend_never initial_suspend() noexcept {
-            return {};
-        }
-
-        // See the QTask<T> specialization above: completion dispatch happens
-        // in detail::dispatchCompletion, with the coroutine suspended.
-        auto final_suspend() noexcept {
-
-            struct Awaiter {
-                bool await_ready() noexcept {
-                    return false;
-                }
-                std::coroutine_handle<> await_suspend(std::coroutine_handle<promise_type> h) noexcept {
-                    return detail::dispatchCompletion(h);
-                }
-                void await_resume() noexcept {}
-            };
-
-            return Awaiter{};
-        }
-
-        void return_void() noexcept {
-            QMutexLocker lock(&mutex);
-            state = State::value;
-        }
-
-        void unhandled_exception() {
-            QMutexLocker lock(&mutex);
-            try {
-                throw;
-            } catch (QtCoroutine::utils::AwaitCancelled & c) {
-                cancelReason = c.reason;
-                state = State::cancelled;
-            } catch (...) {
-                exception = std::current_exception();
-                state = State::error;
-            }
-        }
-
-        // See QTask<T>::promise_type::invokeCallbacks.
-        template<typename ThenFn, typename CancelFn, typename ErrorFn>
-        void invokeCallbacks(ThenFn & then, CancelFn & cancelled, ErrorFn & error) noexcept {
-            try {
-                switch (state) {
-                case State::value:
-                    if (then)
-                        then();
-                    break;
-                case State::cancelled:
-                    if (cancelled)
-                        cancelled(QtCoroutine::utils::AwaitCancelled{cancelReason});
-                    break;
-                case State::error:
-                    if (error)
-                        error(exception);
-                    break;
-                default:
-                    break;
-                }
-            } catch (...) {}
-        }
-
-        std::exception_ptr exception;
-        QtCoroutine::utils::AwaitCancelled::Reason cancelReason{};
-        State state = State::empty;
-        std::function<void()> thenCallback;
-        std::function<void(const QtCoroutine::utils::AwaitCancelled &)> cancelledCallback;
-        std::function<void(std::exception_ptr)> errorCallback;
-        std::coroutine_handle<> continuation;
-        bool detached = false;
-        mutable QMutex mutex;
-        std::shared_ptr<std::atomic<bool>> settled = std::make_shared<std::atomic<bool>>(false);
-        QThread * ownerThread = QThread::currentThread();
-    };
-
-    explicit QTask(std::coroutine_handle<promise_type> handle)
-        : m_handle(handle),
-          m_settled(handle.promise().settled) {}
-
-    ~QTask() {
-        disposeHandle();
-    }
-
-    QTask(QTask && other) noexcept
-        : m_handle(std::exchange(other.m_handle, nullptr)),
-          m_settled(std::move(other.m_settled)) {}
-
-    QTask & operator=(QTask && other) noexcept {
-        if (this != &other) {
-            disposeHandle();
-            m_handle = std::exchange(other.m_handle, nullptr);
-            m_settled = std::move(other.m_settled);
-        }
-        return *this;
-    }
-
-    // See class doc (QTask<T> above) for the fire-and-forget pattern.
-    void detach() {
-        if (!m_handle)
-            return;
-        if (m_settled->load(std::memory_order_acquire)) {
-            {
-                QMutexLocker barrier(&m_handle.promise().mutex);
-            }
-            m_handle.destroy();
-        } else {
-            QMutexLocker lock(&m_handle.promise().mutex);
-            m_handle.promise().detached = true;
-        }
-        m_handle = {};
-    }
-
-    bool await_ready() const noexcept {
-        Q_ASSERT_X(m_handle, "QTask::await_ready", "no coroutine attached (moved-from or detached task)");
-        // The settled flag (not m_handle.done()) so cross-thread observers
-        // get an acquire-synchronized read that also covers the completion
-        // dispatch — done() is true while callbacks are still running.
-        return m_settled->load(std::memory_order_acquire);
-    }
-
-    bool await_suspend(std::coroutine_handle<> caller) {
-        auto & p = m_handle.promise();
-        QMutexLocker lock(&p.mutex);
-        // Settled in the gap since await_ready (cross-thread completion):
-        // don't park a continuation nobody will transfer to — resume now.
-        if (m_settled->load(std::memory_order_acquire))
-            return false;
-        Q_ASSERT_X(!p.continuation, "QTask::co_await", "task is already awaited by another coroutine");
-        p.continuation = caller;
-        return true;
-    }
-
-    void await_resume() {
-        auto & p = m_handle.promise();
-        QMutexLocker lock(&p.mutex);
-        switch (p.state) {
-        case State::value:
-            return;
-        case State::cancelled:
-            throw QtCoroutine::utils::AwaitCancelled{p.cancelReason};
-        case State::error:
-            std::rethrow_exception(p.exception);
-        default:
-            std::unreachable();
-        }
-    }
-
-    bool isCancelled() const {
-        Q_ASSERT_X(m_handle, "QTask::isCancelled", "no coroutine attached (moved-from or detached task)");
-        QMutexLocker lock(&m_handle.promise().mutex);
-        return m_handle.promise().state == State::cancelled;
-    }
-
-    QtCoroutine::utils::AwaitCancelled::Reason cancelReason() const {
-        Q_ASSERT_X(m_handle, "QTask::cancelReason", "no coroutine attached (moved-from or detached task)");
-        QMutexLocker lock(&m_handle.promise().mutex);
-        return m_handle.promise().cancelReason;
-    }
+    using promise_type = detail::TaskPromise<T>;
+    using Base::Base;
 
     template<typename F>
     void then(F && callback) {
@@ -606,42 +439,91 @@ public:
                 return; // pending — the completion dispatch will invoke it
             }
         }
-        if (p.state == State::value)
+        // Settled: dispatch has finished and state is immutable.
+        if (p.state == detail::TaskState::value)
+            callback(*p.result);
+    }
+
+    // Bridge to QFuture — allows use with QFutureWatcher, QtFuture::whenAll, etc.
+    // Consumes the .then/.onCancelled/.onError callbacks; use QFuture's
+    // continuation API after calling this.
+    QFuture<T> toFuture() {
+        auto qpromise = std::make_shared<QPromise<T>>();
+        qpromise->start();
+
+        then([qpromise](const T & val) {
+            qpromise->addResult(val);
+            qpromise->finish();
+        });
+
+        this->onCancelled([qpromise](const QtCoroutine::utils::AwaitCancelled & c) {
+            qpromise->setException(std::make_exception_ptr(c));
+            qpromise->finish();
+        });
+
+        this->onError([qpromise](std::exception_ptr ep) {
+            qpromise->setException(ep);
+            qpromise->finish();
+        });
+
+        return qpromise->future();
+    }
+
+    T await_resume() {
+        auto & p = m_handle.promise();
+        QMutexLocker lock(&p.mutex);
+        switch (p.state) {
+        case detail::TaskState::value:
+            return std::move(*p.result);
+        case detail::TaskState::cancelled:
+            throw QtCoroutine::utils::AwaitCancelled{p.cancelReason};
+        case detail::TaskState::error:
+            std::rethrow_exception(p.exception);
+        default:
+            std::unreachable();
+        }
+    }
+};
+
+// QTask<void> specialization
+template<>
+class QTask<void> : public detail::TaskBase<detail::TaskPromise<void>> {
+    using Base = detail::TaskBase<detail::TaskPromise<void>>;
+
+public:
+    using promise_type = detail::TaskPromise<void>;
+    using Base::Base;
+
+    template<typename F>
+    void then(F && callback) {
+        Q_ASSERT_X(m_handle, "QTask::then", "no coroutine attached (moved-from or detached task)");
+        auto & p = m_handle.promise();
+        Q_ASSERT_X(m_settled->load(std::memory_order_acquire) || QThread::currentThread() == p.ownerThread,
+                   "QTask::then", "register callbacks on a live task only from its owning thread");
+        {
+            QMutexLocker lock(&p.mutex);
+            if (!m_settled->load(std::memory_order_acquire)) {
+                p.thenCallback = std::forward<F>(callback);
+                return; // pending — the completion dispatch will invoke it
+            }
+        }
+        if (p.state == detail::TaskState::value)
             callback();
     }
 
-    template<typename F>
-    void onCancelled(F && callback) {
-        Q_ASSERT_X(m_handle, "QTask::onCancelled", "no coroutine attached (moved-from or detached task)");
+    void await_resume() {
         auto & p = m_handle.promise();
-        Q_ASSERT_X(m_settled->load(std::memory_order_acquire) || QThread::currentThread() == p.ownerThread,
-                   "QTask::onCancelled", "register callbacks on a live task only from its owning thread");
-        {
-            QMutexLocker lock(&p.mutex);
-            if (!m_settled->load(std::memory_order_acquire)) {
-                p.cancelledCallback = std::forward<F>(callback);
-                return;
-            }
+        QMutexLocker lock(&p.mutex);
+        switch (p.state) {
+        case detail::TaskState::value:
+            return;
+        case detail::TaskState::cancelled:
+            throw QtCoroutine::utils::AwaitCancelled{p.cancelReason};
+        case detail::TaskState::error:
+            std::rethrow_exception(p.exception);
+        default:
+            std::unreachable();
         }
-        if (p.state == State::cancelled)
-            callback(QtCoroutine::utils::AwaitCancelled{p.cancelReason});
-    }
-
-    template<typename F>
-    void onError(F && callback) {
-        Q_ASSERT_X(m_handle, "QTask::onError", "no coroutine attached (moved-from or detached task)");
-        auto & p = m_handle.promise();
-        Q_ASSERT_X(m_settled->load(std::memory_order_acquire) || QThread::currentThread() == p.ownerThread,
-                   "QTask::onError", "register callbacks on a live task only from its owning thread");
-        {
-            QMutexLocker lock(&p.mutex);
-            if (!m_settled->load(std::memory_order_acquire)) {
-                p.errorCallback = std::forward<F>(callback);
-                return;
-            }
-        }
-        if (p.state == State::error)
-            callback(p.exception);
     }
 
     QFuture<void> toFuture() {
@@ -662,36 +544,21 @@ public:
 
         return qpromise->future();
     }
-
-private:
-    // Single disposal path for the destructor and move-assignment.
-    void disposeHandle() {
-        if (!m_handle)
-            return;
-        if (m_settled->load(std::memory_order_acquire)) {
-            // Settled: frame is parked at final_suspend. The empty locker
-            // waits out the tail of a dispatch that published `settled` on
-            // another thread moments ago.
-            { QMutexLocker barrier(&m_handle.promise().mutex); }
-            m_handle.destroy();
-        } else if (m_handle.done()) {
-            // Live but at final_suspend: we are inside this task's own
-            // completion dispatch — a callback is destroying or reassigning
-            // its task. Defer to the dispatcher (self-destruct), like
-            // QObject::deleteLater() called from a slot.
-            QMutexLocker lock(&m_handle.promise().mutex);
-            m_handle.promise().detached = true;
-        } else {
-            Q_ASSERT_X(QThread::currentThread() == m_handle.promise().ownerThread, "QTask",
-                       "a live QTask must be destroyed on its owning thread");
-            m_handle.destroy();
-        }
-        m_handle = {};
-    }
-
-    std::coroutine_handle<promise_type> m_handle;
-    std::shared_ptr<std::atomic<bool>> m_settled;
 };
+
+namespace detail {
+
+// Out of line: the promises are defined before QTask is complete.
+template<typename T>
+QTask<T> TaskPromise<T>::get_return_object() {
+    return QTask<T>{std::coroutine_handle<TaskPromise<T>>::from_promise(*this)};
+}
+
+inline QTask<void> TaskPromise<void>::get_return_object() {
+    return QTask<void>{std::coroutine_handle<TaskPromise<void>>::from_promise(*this)};
+}
+
+} // namespace detail
 
 // ------------------------------------------------------------------
 // whenAll — co_await multiple QTasks, resume when all complete.
