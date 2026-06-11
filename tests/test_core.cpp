@@ -2426,7 +2426,11 @@ void test_resumeOn_migrates_to_ctx_thread(QCoreApplication & app) {
 
     emit e.voidSignal(); // main-thread emit, queued to ctx's (worker) thread
 
-    QTimer::singleShot(500, [&]() { app.quit(); }); // watchdog
+    // Watchdog. Receiver-bound (&e): when the then() above quits first, the
+    // pending watchdog dies with the test instead of leaking its app.quit()
+    // into the NEXT test's event loop (a stale quit cascades: it cuts the
+    // next exec short, leaking THAT test's timers in turn).
+    QTimer::singleShot(500, &e, [&]() { app.quit(); });
     app.exec();
 
     TEST_ASSERT(resumedOn == &worker, "code after co_await runs on the resumeOn ctx's thread");
@@ -3166,7 +3170,7 @@ void test_stream_cancelledBy(QCoreApplication & app) {
         std::unique_ptr<QThread> worker(QThread::create([&ss]() { ss.request_stop(); }));
         worker->start(); // after setup — see test 73
 
-        QTimer::singleShot(200, [&]() { app.quit(); });
+        QTimer::singleShot(200, &e, [&]() { app.quit(); });
         app.exec();
         worker->wait();
 
@@ -3211,9 +3215,11 @@ void test_stream_withTimeout(QCoreApplication & app) {
 
     // The parked next() times out at ~150ms. Emit at 225ms: after that
     // timeout, well before the recovered next()'s own ~300ms deadline.
-    QTimer::singleShot(225, [&]() { emit e.oneArg(2); });
+    // Both timers receiver-bound (&e): they capture this test's stack frame
+    // and must never fire after it (see test 76's watchdog note).
+    QTimer::singleShot(225, &e, [&]() { emit e.oneArg(2); });
 
-    QTimer::singleShot(600, [&]() {
+    QTimer::singleShot(600, &e, [&]() {
         TEST_ASSERT(task.await_ready(), "consumer finished");
         TEST_ASSERT(timeouts == 1, "silent wait threw AwaitCancelled{Timeout}");
         TEST_ASSERT((got == std::vector<int>{1, 2}), "stream stayed armed after the timeout (non-fatal)");
@@ -3266,7 +3272,7 @@ void test_stream_cross_thread_lossless(QCoreApplication & app) {
     }));
     worker->start();
 
-    QTimer::singleShot(2000, [&]() { app.quit(); }); // watchdog
+    QTimer::singleShot(2000, &e, [&]() { app.quit(); }); // watchdog, dies with the test (see test 76)
     app.exec();
     worker->wait();
 
@@ -3441,7 +3447,7 @@ void test_stream_resumeOn_pins_consumer_thread(QCoreApplication & app) {
         },
         Qt::QueuedConnection);
 
-    QTimer::singleShot(50, [&]() {
+    QTimer::singleShot(50, &e, [&]() {
         emit e.oneArg(1); // main-thread emissions, marshalled to the pinned worker
         emit e.oneArg(2);
         emit e.oneArg(3);
@@ -3453,7 +3459,7 @@ void test_stream_resumeOn_pins_consumer_thread(QCoreApplication & app) {
             app.quit();
     });
     pump.start(10);
-    QTimer::singleShot(2000, [&]() { app.quit(); }); // watchdog
+    QTimer::singleShot(2000, &e, [&]() { app.quit(); }); // watchdog, dies with the test (see test 76)
     app.exec();
 
     worker.quit();
