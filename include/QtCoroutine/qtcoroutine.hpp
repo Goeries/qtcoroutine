@@ -271,10 +271,14 @@ public:
 
         // Armed last: from this point the signal can fire (and, with
         // resumeOn, resume the coroutine on another thread) at any moment.
+        // Only the first Args::count arguments are stored — a trailing
+        // QPrivateSignal (stripped from Tuple by SignalArgs) is dropped.
         cb->signalConnection = QObject::connect(m_sender, m_signal, ctx, [cb, handle](auto &&... args) mutable {
             if (cb->resumed.exchange(true, std::memory_order_acq_rel))
                 return;
-            cb->result.emplace(std::forward<decltype(args)>(args)...);
+            [&]<std::size_t... I>(std::index_sequence<I...>, auto && all) {
+                cb->result.emplace(std::get<I>(std::move(all))...);
+            }(std::make_index_sequence<Args::count>{}, std::forward_as_tuple(std::forward<decltype(args)>(args)...));
             handle.resume();
         });
     }

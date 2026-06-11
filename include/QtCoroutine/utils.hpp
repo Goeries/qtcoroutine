@@ -1,4 +1,5 @@
 #pragma once
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string_view>
@@ -8,13 +9,44 @@
 
 namespace QtCoroutine::utils {
 
+namespace detail {
+
+// Qt declares some signals with a trailing QPrivateSignal argument to
+// forbid external emission (e.g. QTimer::timeout). It is an implementation
+// detail of the sender, so SignalArgs strips it — awaits and streams see
+// the public signature only. Detection as in Qt's own qfuture_impl.h: the
+// elaborated `class T::QPrivateSignal` finds the nested class without
+// falling into the rules of [class.qual]/2.
+template<typename T, typename = void>
+inline constexpr bool isPrivateSignalArg = false;
+template<typename T>
+inline constexpr bool isPrivateSignalArg<T, std::enable_if_t<std::is_class_v<class T::QPrivateSignal>>> = true;
+
+template<typename Tuple, typename Seq>
+struct TupleSelect;
+template<typename Tuple, std::size_t... I>
+struct TupleSelect<Tuple, std::index_sequence<I...>> {
+    using type = std::tuple<std::tuple_element_t<I, Tuple>...>;
+};
+
+template<typename Tuple>
+struct StripPrivateSignal {
+    using type = Tuple;
+};
+template<typename... A>
+    requires(sizeof...(A) > 0) && isPrivateSignalArg<std::tuple_element_t<sizeof...(A) - 1, std::tuple<A...>>>
+struct StripPrivateSignal<std::tuple<A...>>
+    : TupleSelect<std::tuple<A...>, std::make_index_sequence<sizeof...(A) - 1>> {};
+
+} // namespace detail
+
 template<typename Signal>
 struct SignalArgs;
 
 template<typename T, typename... Args>
 struct SignalArgs<void (T::*)(Args...)> {
-    using tuple_type = std::tuple<std::decay_t<Args>...>;
-    static constexpr auto count = sizeof...(Args);
+    using tuple_type = typename detail::StripPrivateSignal<std::tuple<std::decay_t<Args>...>>::type;
+    static constexpr auto count = std::tuple_size_v<tuple_type>;
 };
 
 template<typename T, typename... Args>

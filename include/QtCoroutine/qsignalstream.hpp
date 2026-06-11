@@ -47,33 +47,6 @@ struct StreamFor<std::tuple<A...>> {
     using type = QSignalStream<A...>;
 };
 
-// Qt declares some signals with a trailing QPrivateSignal argument to
-// forbid external emission (e.g. QTimer::timeout). It is an implementation
-// detail of the sender — strip it so QSignalStream<QTimer::QPrivateSignal>
-// doesn't happen. Detection as in Qt's own qfuture_impl.h: the elaborated
-// `class T::QPrivateSignal` finds the nested class without falling into
-// the rules of [class.qual]/2.
-template<typename T, typename = void>
-inline constexpr bool isPrivateSignalArg = false;
-template<typename T>
-inline constexpr bool isPrivateSignalArg<T, std::enable_if_t<std::is_class_v<class T::QPrivateSignal>>> = true;
-
-template<typename Tuple, typename Seq>
-struct TupleSelect;
-template<typename Tuple, std::size_t... I>
-struct TupleSelect<Tuple, std::index_sequence<I...>> {
-    using type = std::tuple<std::tuple_element_t<I, Tuple>...>;
-};
-
-template<typename Tuple>
-struct StripPrivateSignal {
-    using type = Tuple;
-};
-template<typename... A>
-    requires(sizeof...(A) > 0) && isPrivateSignalArg<std::tuple_element_t<sizeof...(A) - 1, std::tuple<A...>>>
-struct StripPrivateSignal<std::tuple<A...>>
-    : TupleSelect<std::tuple<A...>, std::make_index_sequence<sizeof...(A) - 1>> {};
-
 } // namespace detail
 
 // ------------------------------------------------------------------
@@ -324,7 +297,7 @@ public:
         // No connection context: runs directly on the emitting thread, so
         // enqueueing never depends on any event loop being responsive.
         // Only the first argCount arguments are queued — a trailing
-        // QPrivateSignal (stripped from Args by stream()) is dropped.
+        // QPrivateSignal (stripped from Args by SignalArgs) is dropped.
         m_cb->signalConnection = QObject::connect(sender, sig, [cb](auto &&... args) {
             QMutexLocker lock(&cb->mutex);
             if (cb->stopped || cb->ended || cb->ctxDestroyed)
@@ -454,8 +427,9 @@ private:
 template<typename Sender, typename Signal>
     requires std::derived_from<Sender, QObject>
 [[nodiscard]] auto stream(Sender * sender, Signal sig) {
-    using ArgsTuple = typename detail::StripPrivateSignal<typename utils::SignalArgs<Signal>::tuple_type>::type;
-    using Stream = typename detail::StreamFor<ArgsTuple>::type;
+    // SignalArgs strips a trailing QPrivateSignal, so QTimer::timeout
+    // deduces QSignalStream<>, not QSignalStream<QTimer::QPrivateSignal>.
+    using Stream = typename detail::StreamFor<typename utils::SignalArgs<Signal>::tuple_type>::type;
     return Stream(sender, sig);
 }
 

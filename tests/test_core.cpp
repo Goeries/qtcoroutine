@@ -3470,6 +3470,43 @@ void test_stream_resumeOn_pins_consumer_thread(QCoreApplication & app) {
     TEST_ASSERT((got == std::vector<int>{1, 2, 3}), "all values delivered to the pinned thread, in order");
 }
 
+// ====================================================================
+// 98. QPrivateSignal stripped everywhere: Qt-internal trailing args
+//     (QTimer::timeout) don't leak into result types — the one-shot
+//     await is void and the stream deduces QSignalStream<>
+// ====================================================================
+
+QtCoroutine::QTask<bool> awaitTimerTick98(QTimer * t) {
+    co_await QtCoroutine::signal(t, &QTimer::timeout); // void — nothing to discard
+    co_return true;
+}
+
+void test_private_signal_stripped(QCoreApplication & app) {
+    std::cout << "test_private_signal_stripped\n";
+
+    using TimeoutSignal = decltype(&QTimer::timeout);
+    static_assert(QtCoroutine::utils::SignalArgs<TimeoutSignal>::count == 0,
+                  "trailing QPrivateSignal must not count as a signal argument");
+    static_assert(std::is_void_v<QtCoroutine::utils::ConnectResultT<TimeoutSignal>>,
+                  "one-shot await of QTimer::timeout is void");
+
+    QTimer t;
+    t.setSingleShot(true);
+    static_assert(std::is_same_v<decltype(QtCoroutine::stream(&t, &QTimer::timeout)), QtCoroutine::QSignalStream<>>,
+                  "stream over QTimer::timeout is the 0-arg shape");
+
+    auto task = awaitTimerTick98(&t);
+    TEST_ASSERT(!task.await_ready(), "timeout await parked");
+    t.start(10);
+
+    QTimer::singleShot(200, &t, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "timeout await resumed");
+    if (task.await_ready())
+        TEST_ASSERT(task.await_resume(), "private-signal await completed normally");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -3581,6 +3618,7 @@ int main(int argc, char * argv[]) {
     test_stream_frame_destroyed_while_parked(app);
     test_stream_asExpected(app);
     test_stream_resumeOn_pins_consumer_thread(app);
+    test_private_signal_stripped(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
