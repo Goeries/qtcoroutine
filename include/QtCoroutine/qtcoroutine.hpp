@@ -325,7 +325,10 @@ private:
     Signal m_signal;
     QObject * m_resumeCtx = nullptr;
     std::stop_token m_stop;
-    [[no_unique_address]] ReadyCheck m_ready;
+    // Value-initialized: the (Sender*, Signal) constructor doesn't list it
+    // (only the readyIf() rebuild constructor does), and a formally
+    // indeterminate member trips clang-analyzer's UninitializedObject.
+    [[no_unique_address]] ReadyCheck m_ready{};
     std::optional<std::chrono::milliseconds> m_timeout;
     std::shared_ptr<ControlBlock> m_cb = std::make_shared<ControlBlock>();
 };
