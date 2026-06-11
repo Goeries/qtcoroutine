@@ -2885,6 +2885,585 @@ void test_cross_thread_request_stop_cancelledBy(QCoreApplication & app) {
     worker->wait();
 }
 
+// ====================================================================
+// 87. QSignalStream — lossless delivery: emissions queued from
+//     construction (before the first next()) and a same-thread burst
+//     while parked all arrive in order (the fix for the one-shot
+//     limitation documented in test 39); the handle stays wired across
+//     move construction and move assignment
+// ====================================================================
+
+QtCoroutine::QTask<std::vector<int>> streamTake87(QtCoroutine::QSignalStream<int> * s, int count) {
+    std::vector<int> out;
+    while (static_cast<int>(out.size()) < count) {
+        auto v = co_await s->next();
+        if (!v)
+            break;
+        out.push_back(*v);
+    }
+    co_return out;
+}
+
+void test_stream_lossless_burst(QCoreApplication & app) {
+    std::cout << "test_stream_lossless_burst\n";
+
+    Emitter e, e2;
+    auto s0 = QtCoroutine::stream(&e, &Emitter::oneArg);
+
+    // The connection arms AT CONSTRUCTION: emissions before the first
+    // next() are queued, not lost.
+    emit e.oneArg(1);
+    emit e.oneArg(2);
+    emit e.oneArg(3);
+
+    // Moves keep the queue and the connection wired.
+    QtCoroutine::QSignalStream<int> s(std::move(s0)); // move ctor
+    auto s2 = QtCoroutine::stream(&e2, &Emitter::oneArg);
+    s2 = std::move(s);  // move assign disposes the old e2 connection
+    emit e2.oneArg(99); // must be ignored — that connection is gone
+
+    auto task = streamTake87(&s2, 6);
+    TEST_ASSERT(!task.await_ready(), "consumer drains the pre-next queue and parks for more");
+
+    // Burst while parked: each same-thread emission resumes the consumer
+    // synchronously; nothing is lost between resume and the next() re-arm.
+    emit e.oneArg(4);
+    emit e.oneArg(5);
+    emit e.oneArg(6);
+
+    TEST_ASSERT(task.await_ready(), "consumer received all six emissions");
+    if (task.await_ready()) {
+        auto got = task.await_resume();
+        TEST_ASSERT((got == std::vector<int>{1, 2, 3, 4, 5, 6}),
+                    "pre-next queue and burst delivered in order, nothing lost");
+    }
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 88. QSignalStream — arity shapes: 0-arg signal -> bool loop ending on
+//     sender destruction; 2-arg signal -> optional<tuple>
+// ====================================================================
+
+QtCoroutine::QTask<int> streamCountVoid88(QtCoroutine::QSignalStream<> * s) {
+    int n = 0;
+    while (co_await s->next())
+        ++n;
+    co_return n;
+}
+
+QtCoroutine::QTask<void> streamTakeTwoArgs88(QtCoroutine::QSignalStream<bool, QString> * s, bool * ok, QString * msg) {
+    auto v = co_await s->next();
+    if (v) {
+        *ok = std::get<0>(*v);
+        *msg = std::get<1>(*v);
+    }
+}
+
+void test_stream_arity_shapes(QCoreApplication & app) {
+    std::cout << "test_stream_arity_shapes\n";
+
+    // 0-arg signal -> bool: while (co_await s.next()) counts iterations
+    // and ends (false) when the sender is destroyed.
+    {
+        auto * e = new Emitter;
+        auto s = QtCoroutine::stream(e, &Emitter::voidSignal);
+        auto task = streamCountVoid88(&s);
+        TEST_ASSERT(!task.await_ready(), "0-arg consumer parked");
+
+        emit e->voidSignal();
+        emit e->voidSignal();
+        emit e->voidSignal();
+        delete e; // EOF — next() returns false, the loop exits
+
+        TEST_ASSERT(task.await_ready(), "0-arg consumer ended at sender destruction");
+        if (task.await_ready())
+            TEST_ASSERT(task.await_resume() == 3, "every void emission counted");
+    }
+
+    // 2-arg signal -> optional<tuple<bool, QString>>.
+    {
+        Emitter e;
+        static_assert(std::is_same_v<decltype(QtCoroutine::stream(&e, &Emitter::twoArgs)),
+                                     QtCoroutine::QSignalStream<bool, QString>>,
+                      "stream() deduces the decayed signal argument types");
+        auto s = QtCoroutine::stream(&e, &Emitter::twoArgs);
+        bool ok = false;
+        QString msg;
+        auto task = streamTakeTwoArgs88(&s, &ok, &msg);
+        TEST_ASSERT(!task.await_ready(), "2-arg consumer parked");
+
+        emit e.twoArgs(true, "stream");
+
+        TEST_ASSERT(task.await_ready(), "2-arg consumer resumed");
+        TEST_ASSERT(ok == true, "tuple first element correct");
+        TEST_ASSERT(msg == "stream", "tuple second element correct");
+    }
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 89. QSignalStream — latestOnly(): depth-1 conflation keeps only the
+//     newest of a burst; a later single emission still arrives normally
+// ====================================================================
+
+void test_stream_latestOnly(QCoreApplication & app) {
+    std::cout << "test_stream_latestOnly\n";
+
+    Emitter e;
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg).latestOnly();
+
+    // Burst with nobody consuming: each emission replaces the queue.
+    emit e.oneArg(1);
+    emit e.oneArg(2);
+    emit e.oneArg(3);
+
+    auto task = streamTake87(&s, 2);
+    TEST_ASSERT(!task.await_ready(), "consumer took the conflated value and parked");
+
+    emit e.oneArg(7); // a later single emission is delivered as usual
+
+    TEST_ASSERT(task.await_ready(), "consumer finished");
+    if (task.await_ready()) {
+        auto got = task.await_resume();
+        TEST_ASSERT((got == std::vector<int>{3, 7}), "only the newest burst value, then the normal one");
+    }
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 90. QSignalStream — sender destroyed: queued values still drain, then
+//     next() returns nullopt forever (idempotent EOF, no exception)
+// ====================================================================
+
+QtCoroutine::QTask<std::vector<int>> streamDrainToEof90(QtCoroutine::QSignalStream<int> * s, int * eofCount) {
+    std::vector<int> out;
+    while (auto v = co_await s->next())
+        out.push_back(*v);
+    ++*eofCount;
+    if (!(co_await s->next())) // EOF must be idempotent
+        ++*eofCount;
+    co_return out;
+}
+
+void test_stream_sender_destroyed_drains(QCoreApplication & app) {
+    std::cout << "test_stream_sender_destroyed_drains\n";
+
+    auto * e = new Emitter;
+    auto s = QtCoroutine::stream(e, &Emitter::oneArg);
+
+    emit e->oneArg(10);
+    emit e->oneArg(20);
+    delete e; // the queue still holds both values
+
+    int eofCount = 0;
+    auto task = streamDrainToEof90(&s, &eofCount);
+
+    TEST_ASSERT(task.await_ready(), "drain and EOF all settle synchronously");
+    if (task.await_ready()) {
+        auto got = task.await_resume();
+        TEST_ASSERT((got == std::vector<int>{10, 20}), "queued values delivered after sender death");
+    }
+    TEST_ASSERT(eofCount == 2, "next() keeps returning nullopt after EOF — idempotent, no exception");
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 91. QSignalStream — cancelledBy(): the stop is terminal and immediate
+//     (queued values are NOT drained); a pre-stopped token behaves the
+//     same; request_stop may come from any thread
+// ====================================================================
+
+QtCoroutine::QTask<void> streamConsumeCancellable91(QtCoroutine::QSignalStream<int> * s, int * delivered,
+                                                    int * stoppedThrows) {
+    try {
+        while (co_await s->next())
+            ++*delivered;
+    } catch (const QtCoroutine::AwaitCancelled & c) {
+        if (c.wasStopped())
+            ++*stoppedThrows;
+    }
+    try {
+        co_await s->next(); // terminal: every later next() throws too
+    } catch (const QtCoroutine::AwaitCancelled & c) {
+        if (c.wasStopped())
+            ++*stoppedThrows;
+    }
+}
+
+void test_stream_cancelledBy(QCoreApplication & app) {
+    std::cout << "test_stream_cancelledBy\n";
+
+    // (a) Pending next(): request_stop wakes it with AwaitCancelled{Stopped}.
+    {
+        Emitter e;
+        std::stop_source ss;
+        auto s = QtCoroutine::stream(&e, &Emitter::oneArg).cancelledBy(ss.get_token());
+
+        int delivered = 0, stoppedThrows = 0;
+        auto task = streamConsumeCancellable91(&s, &delivered, &stoppedThrows);
+        TEST_ASSERT(!task.await_ready(), "consumer parked");
+
+        emit e.oneArg(1); // still flows before the stop
+        TEST_ASSERT(delivered == 1, "value delivered before the stop");
+
+        ss.request_stop(); // same-thread: wakes the parked next() synchronously
+
+        TEST_ASSERT(task.await_ready(), "consumer unwound after the stop");
+        TEST_ASSERT(stoppedThrows == 2, "pending next() and the later next() both threw Stopped");
+    }
+
+    // (b) Queued values must NOT be drained once the token fired.
+    {
+        Emitter e;
+        std::stop_source ss;
+        auto s = QtCoroutine::stream(&e, &Emitter::oneArg).cancelledBy(ss.get_token());
+
+        emit e.oneArg(1);
+        emit e.oneArg(2);
+        ss.request_stop();
+
+        int delivered = 0, stoppedThrows = 0;
+        auto task = streamConsumeCancellable91(&s, &delivered, &stoppedThrows);
+        TEST_ASSERT(task.await_ready(), "stopped stream settles next() immediately");
+        TEST_ASSERT(delivered == 0, "stop wins over queued values — no drain");
+        TEST_ASSERT(stoppedThrows == 2, "first and subsequent next() throw Stopped");
+    }
+
+    // (c) Token already stopped at builder time behaves the same.
+    {
+        Emitter e;
+        std::stop_source ss;
+        ss.request_stop();
+        auto s = QtCoroutine::stream(&e, &Emitter::oneArg).cancelledBy(ss.get_token());
+        emit e.oneArg(5); // ignored — the stream is already stopped
+
+        int delivered = 0, stoppedThrows = 0;
+        auto task = streamConsumeCancellable91(&s, &delivered, &stoppedThrows);
+        TEST_ASSERT(task.await_ready(), "pre-stopped token settles next() immediately");
+        TEST_ASSERT(delivered == 0 && stoppedThrows == 2, "pre-stopped token behaves like a later stop");
+    }
+
+    // (d) request_stop from another thread marshals the wake back to the
+    //     consumer thread.
+    {
+        Emitter e; // never emits
+        std::stop_source ss;
+        auto s = QtCoroutine::stream(&e, &Emitter::oneArg).cancelledBy(ss.get_token());
+
+        int delivered = 0, stoppedThrows = 0;
+        auto task = streamConsumeCancellable91(&s, &delivered, &stoppedThrows);
+        TEST_ASSERT(!task.await_ready(), "consumer parked");
+
+        std::unique_ptr<QThread> worker(QThread::create([&ss]() { ss.request_stop(); }));
+        worker->start(); // after setup — see test 73
+
+        QTimer::singleShot(200, [&]() { app.quit(); });
+        app.exec();
+        worker->wait();
+
+        TEST_ASSERT(task.await_ready(), "cross-thread request_stop cancels the pending next()");
+        TEST_ASSERT(delivered == 0 && stoppedThrows == 2, "stop delivered on the consumer thread");
+    }
+}
+
+// ====================================================================
+// 92. QSignalStream — withTimeout(): a queued value returns immediately
+//     (no timeout while not waiting); a silent wait throws
+//     AwaitCancelled{Timeout}; the stream stays armed afterwards
+// ====================================================================
+
+QtCoroutine::QTask<void> streamTimeoutRecover92(QtCoroutine::QSignalStream<int> * s, std::vector<int> * got,
+                                                int * timeouts) {
+    if (auto v = co_await s->next()) // queued value: no wait, no timeout
+        got->push_back(*v);
+    try {
+        co_await s->next(); // nothing queued, nothing emitted -> Timeout
+    } catch (const QtCoroutine::AwaitCancelled & c) {
+        if (c.wasTimedOut())
+            ++*timeouts;
+    }
+    if (auto v = co_await s->next()) // non-fatal: still armed and usable
+        got->push_back(*v);
+}
+
+void test_stream_withTimeout(QCoreApplication & app) {
+    std::cout << "test_stream_withTimeout\n";
+
+    Emitter e;
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg).withTimeout(std::chrono::milliseconds(150));
+
+    emit e.oneArg(1); // queued before the consumer starts
+
+    std::vector<int> got;
+    int timeouts = 0;
+    auto task = streamTimeoutRecover92(&s, &got, &timeouts);
+    TEST_ASSERT(!task.await_ready(), "consumer parked on the waiting next()");
+    TEST_ASSERT((got == std::vector<int>{1}), "queued value returned immediately, no timeout");
+
+    // The parked next() times out at ~150ms. Emit at 225ms: after that
+    // timeout, well before the recovered next()'s own ~300ms deadline.
+    QTimer::singleShot(225, [&]() { emit e.oneArg(2); });
+
+    QTimer::singleShot(600, [&]() {
+        TEST_ASSERT(task.await_ready(), "consumer finished");
+        TEST_ASSERT(timeouts == 1, "silent wait threw AwaitCancelled{Timeout}");
+        TEST_ASSERT((got == std::vector<int>{1, 2}), "stream stayed armed after the timeout (non-fatal)");
+        app.quit();
+    });
+
+    app.exec();
+}
+
+// ====================================================================
+// 93. QSignalStream — cross-thread lossless: a rapid worker-thread burst
+//     of 50 values is fully delivered, in order, with the loop body on
+//     the consumer (main) thread
+// ====================================================================
+
+QtCoroutine::QTask<void> streamConsumeOnThread93(QtCoroutine::QSignalStream<int> * s, std::vector<int> * out,
+                                                 std::atomic<bool> * threadOk, QThread * expected,
+                                                 std::atomic<bool> * done, int count) {
+    while (static_cast<int>(out->size()) < count) {
+        auto v = co_await s->next();
+        if (!v)
+            break;
+        if (QThread::currentThread() != expected)
+            threadOk->store(false, std::memory_order_relaxed);
+        out->push_back(*v);
+    }
+    done->store(true, std::memory_order_release);
+}
+
+void test_stream_cross_thread_lossless(QCoreApplication & app) {
+    std::cout << "test_stream_cross_thread_lossless\n";
+
+    constexpr int N = 50;
+
+    Emitter e; // lives on the main thread; emissions are inputs from anywhere
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg);
+
+    std::vector<int> got;
+    std::atomic<bool> threadOk{true};
+    std::atomic<bool> done{false};
+    auto task = streamConsumeOnThread93(&s, &got, &threadOk, QThread::currentThread(), &done, N);
+    TEST_ASSERT(!task.await_ready(), "consumer parked before the burst");
+
+    task.then([&]() { app.quit(); }); // completes on the consumer (main) thread
+
+    // Start the worker only after stream + consumer setup — see test 73.
+    std::unique_ptr<QThread> worker(QThread::create([&e]() {
+        for (int i = 0; i < N; ++i)
+            emit e.oneArg(i); // enqueued directly from the emitting thread
+    }));
+    worker->start();
+
+    QTimer::singleShot(2000, [&]() { app.quit(); }); // watchdog
+    app.exec();
+    worker->wait();
+
+    TEST_ASSERT(task.await_ready(), "consumer received the full burst");
+    TEST_ASSERT(static_cast<int>(got.size()) == N, "all 50 cross-thread emissions delivered (lossless)");
+    bool ordered = got.size() == static_cast<std::size_t>(N);
+    for (int i = 0; i < static_cast<int>(got.size()); ++i)
+        if (got[i] != i)
+            ordered = false;
+    TEST_ASSERT(ordered, "values delivered in emission order");
+    TEST_ASSERT(threadOk.load(), "loop body ran on the consumer (main) thread");
+}
+
+// ====================================================================
+// 94. QSignalStream — same-thread synchronous resume (direct-slot
+//     semantics) and re-entrancy: emissions from inside the loop body
+//     are queued and delivered by subsequent next() calls
+// ====================================================================
+
+QtCoroutine::QTask<void> streamReentrantConsumer94(QtCoroutine::QSignalStream<int> * s, Emitter * e,
+                                                   std::vector<int> * got) {
+    while (auto v = co_await s->next()) {
+        got->push_back(*v);
+        if (*v == 1) {
+            // We are running INSIDE the test's emit statement. These nested
+            // emissions find no parked waiter and must queue, not vanish.
+            emit e->oneArg(2);
+            emit e->oneArg(3);
+        }
+        if (*v == 3)
+            break;
+    }
+}
+
+void test_stream_synchronous_resume_reentrancy(QCoreApplication & app) {
+    std::cout << "test_stream_synchronous_resume_reentrancy\n";
+
+    Emitter e;
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg);
+
+    std::vector<int> got;
+    auto task = streamReentrantConsumer94(&s, &e, &got);
+    TEST_ASSERT(!task.await_ready(), "consumer parked");
+
+    emit e.oneArg(1); // resumes the consumer synchronously, like a direct slot
+
+    // Everything happened inside the emit statement above: the loop body ran
+    // synchronously and its nested emissions were consumed without loss.
+    TEST_ASSERT((got == std::vector<int>{1, 2, 3}),
+                "loop body ran inside the emit; nested emissions queued and delivered in order");
+    TEST_ASSERT(task.await_ready(), "consumer completed inside the emit");
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 95. QSignalStream — coroutine frame destroyed while parked on next():
+//     a later emission must not resume freed memory (ASan-verified); it
+//     is safely queued and the stream stays usable
+// ====================================================================
+
+QtCoroutine::QTask<void> streamParkedConsumer95(QtCoroutine::QSignalStream<int> * s, bool * resumed) {
+    co_await s->next();
+    *resumed = true;
+}
+
+void test_stream_frame_destroyed_while_parked(QCoreApplication & app) {
+    std::cout << "test_stream_frame_destroyed_while_parked\n";
+
+    Emitter e;
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg);
+
+    bool resumed = false;
+    {
+        auto task = streamParkedConsumer95(&s, &resumed);
+        TEST_ASSERT(!task.await_ready(), "consumer parked");
+    } // QTask destroyed: frame destruction unparks the pending next()
+
+    emit e.oneArg(7); // must not touch the destroyed frame
+
+    TEST_ASSERT(!resumed, "destroyed frame must not resume");
+
+    // The stream is still healthy: a fresh consumer picks up the value the
+    // dropped wake left queued.
+    auto task2 = streamTake87(&s, 1);
+    TEST_ASSERT(task2.await_ready(), "fresh consumer drained the safely-queued emission");
+    if (task2.await_ready())
+        TEST_ASSERT((task2.await_resume() == std::vector<int>{7}), "the emission was queued, not lost");
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 96. QSignalStream — next().asExpected(): values pass through; after
+//     request_stop every await yields unexpected(wasStopped) — no throw
+// ====================================================================
+
+QtCoroutine::QTask<void> streamAsExpected96(QtCoroutine::QSignalStream<int> * s, std::vector<int> * got,
+                                            int * stoppedErrors) {
+    auto ok = co_await s->next().asExpected();
+    if (ok && *ok)
+        got->push_back(**ok);
+    auto r1 = co_await s->next().asExpected(); // the stop arrives while parked
+    if (!r1 && r1.error().wasStopped())
+        ++*stoppedErrors;
+    auto r2 = co_await s->next().asExpected(); // terminal, still no throw
+    if (!r2 && r2.error().wasStopped())
+        ++*stoppedErrors;
+}
+
+void test_stream_asExpected(QCoreApplication & app) {
+    std::cout << "test_stream_asExpected\n";
+
+    Emitter e;
+    std::stop_source ss;
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg).cancelledBy(ss.get_token());
+
+    std::vector<int> got;
+    int stoppedErrors = 0;
+    auto task = streamAsExpected96(&s, &got, &stoppedErrors);
+    TEST_ASSERT(!task.await_ready(), "consumer parked on the first next()");
+
+    emit e.oneArg(9); // success path through asExpected
+    TEST_ASSERT((got == std::vector<int>{9}), "asExpected passes values through");
+
+    ss.request_stop(); // resumes the parked next() synchronously
+
+    TEST_ASSERT(task.await_ready(), "consumer ran to completion — nothing thrown");
+    TEST_ASSERT(stoppedErrors == 2, "stop surfaces as unexpected(wasStopped) on this and every later next()");
+    TEST_ASSERT(!task.isCancelled(), "no AwaitCancelled escaped the coroutine");
+
+    QTimer::singleShot(10, [&]() { app.quit(); });
+    app.exec();
+}
+
+// ====================================================================
+// 97. QSignalStream — resumeOn(ctx) PINS the consumer loop to ctx's
+//     thread: next() is awaited on the worker from the first call,
+//     deliveries land there, and main-thread emissions marshal across
+//     (infrastructure mirrors test 76)
+// ====================================================================
+
+void test_stream_resumeOn_pins_consumer_thread(QCoreApplication & app) {
+    std::cout << "test_stream_resumeOn_pins_consumer_thread\n";
+
+    QThread worker;
+    worker.start();
+    while (!worker.eventDispatcher()) // the pinned thread needs a live dispatcher
+        QThread::msleep(1);
+
+    Emitter e; // sender stays on the main thread
+    QObject ctx;
+    ctx.moveToThread(&worker);
+
+    // Built on main; consumption is pinned to ctx's (the worker's) thread.
+    auto s = QtCoroutine::stream(&e, &Emitter::oneArg).resumeOn(&ctx);
+
+    std::vector<int> got;
+    std::atomic<bool> threadOk{true};
+    std::atomic<bool> done{false};
+
+    // Start the consumer ON the worker thread (pinning is not migration:
+    // the first next() must already be awaited there). The detached frame
+    // self-destructs on completion.
+    auto * sp = &s;
+    QMetaObject::invokeMethod(
+        &ctx,
+        [sp, &got, &threadOk, &worker, &done]() {
+            streamConsumeOnThread93(sp, &got, &threadOk, &worker, &done, 3).detach();
+        },
+        Qt::QueuedConnection);
+
+    QTimer::singleShot(50, [&]() {
+        emit e.oneArg(1); // main-thread emissions, marshalled to the pinned worker
+        emit e.oneArg(2);
+        emit e.oneArg(3);
+    });
+
+    QTimer pump; // poll for completion instead of guessing a fixed delay
+    QObject::connect(&pump, &QTimer::timeout, [&]() {
+        if (done.load(std::memory_order_acquire))
+            app.quit();
+    });
+    pump.start(10);
+    QTimer::singleShot(2000, [&]() { app.quit(); }); // watchdog
+    app.exec();
+
+    worker.quit();
+    worker.wait(); // join: publishes `got` back to the main thread
+
+    TEST_ASSERT(done.load(std::memory_order_acquire), "pinned consumer completed on the worker");
+    TEST_ASSERT(threadOk.load(), "loop body observed the resumeOn ctx's thread");
+    TEST_ASSERT((got == std::vector<int>{1, 2, 3}), "all values delivered to the pinned thread, in order");
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2985,6 +3564,17 @@ int main(int argc, char * argv[]) {
     test_then_with_cross_thread_completion(app);
     test_cross_thread_request_stop(app);
     test_cross_thread_request_stop_cancelledBy(app);
+    test_stream_lossless_burst(app);
+    test_stream_arity_shapes(app);
+    test_stream_latestOnly(app);
+    test_stream_sender_destroyed_drains(app);
+    test_stream_cancelledBy(app);
+    test_stream_withTimeout(app);
+    test_stream_cross_thread_lossless(app);
+    test_stream_synchronous_resume_reentrancy(app);
+    test_stream_frame_destroyed_while_parked(app);
+    test_stream_asExpected(app);
+    test_stream_resumeOn_pins_consumer_thread(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;

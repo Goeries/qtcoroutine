@@ -50,6 +50,25 @@ auto result = co_await QtCoroutine::connect(&obj, &Obj::finished)
     });
 ```
 
+### Signal Streams
+
+`co_await connect(...)` captures one emission. For signals that fire repeatedly, a stream connects once — at construction, so nothing is missed — queues every emission, and hands them out one per `co_await`:
+
+```cpp
+auto bytes = QtCoroutine::stream(&socket, &QIODevice::readyRead);
+while (co_await bytes.next()) {              // void signal → bool
+    consume(socket.readAll());
+}
+
+auto progress = QtCoroutine::stream(&worker, &Worker::progress)
+    .latestOnly();                           // conflate: only the newest value is kept
+while (auto p = co_await progress.next()) {  // int signal → std::optional<int>
+    updateBar(*p);
+}
+```
+
+The sender being destroyed ends the stream like reaching EOF: queued values still drain, then `next()` returns `false`/`nullopt` and the loop exits — no exception, no try/catch for ordinary object teardown. Caller-side aborts do throw, consistent with one-shot awaits: `.cancelledBy(st)` → `AwaitCancelled{Stopped}` (immediate, terminal), `.withTimeout(ms)` → `AwaitCancelled{Timeout}` for any wait that goes that long without an emission (non-fatal — the stream stays armed and usable). `next().asExpected()` opts into `std::expected` instead. Buffering is unbounded by default; multi-arg signals yield `std::optional<std::tuple<...>>`, and the stream type is spelled by the signal's argument types — `QSignalStream<int>` — so it stores cleanly as a member.
+
 ### QTask — Coroutine Return Type
 
 `QTask<T>` is a coroutine type with continuations, cancellation state, and QFuture bridging:
@@ -156,6 +175,7 @@ int value = QtCoroutine::waitFor(compute());
 | Header | Purpose |
 |--------|---------|
 | `QtCoroutine/qtcoroutine.hpp` | Signal awaiting, builder pattern, `sleep()` |
+| `QtCoroutine/qsignalstream.hpp` | `QSignalStream` — lossless `co_await` loops over repeating signals |
 | `QtCoroutine/qtask.hpp` | `QTask<T>`, `whenAll`, `tryAll`, `whenAny`, `withTimeout`, `cancelledBy` |
 | `QtCoroutine/qfuture_coroutine_traits.hpp` | `QFuture<T>` as coroutine return type + `co_await` |
 | `QtCoroutine/utils.hpp` | Type utilities, `AwaitCancelled` |
@@ -187,6 +207,7 @@ The defaults follow `QObject::connect`: the suspended coroutine is the receiver,
 
 - A `co_await` resumes on the thread it suspended on, regardless of which thread the sender lives on or emits from — code after the `co_await` runs on the same thread as the code before it. A same-thread emission resumes synchronously inside the `emit`, exactly like a direct-connected slot.
 - `.resumeOn(ctx)` explicitly migrates the coroutine: delivery and everything after the `co_await` run on `ctx`'s thread.
+- A signal stream *pins* its consumer instead of migrating it: `next()` is awaited on the stream's construction thread — or, with `.resumeOn(ctx)`, on `ctx`'s thread from the first `next()` on (debug-asserted). Emissions remain unrestricted inputs from any thread; values are queued from the emitting thread and the wake is marshalled to the consumer.
 - Inputs are unrestricted: signals may be emitted, futures completed, and `request_stop()` called from any thread; the library marshals the resume back to the right thread.
 - The task handle is thread-affine: while a task is live, owner-side operations — `co_await`, `then`/`onCancelled`/`onError`, `toFuture`, `detach`, destruction — belong on the thread that created it (debug-asserted). Once settled, querying and destroying are safe from any thread that has synchronized with the completion. After migrating with `resumeOn`, bridge results back with `toFuture()`.
 

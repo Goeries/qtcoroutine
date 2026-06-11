@@ -1,4 +1,5 @@
 #pragma once
 #include "qtcoroutine.hpp"
 #include "qfuture_coroutine_traits.hpp"
+#include "qsignalstream.hpp"
 #include "qtask.hpp"
