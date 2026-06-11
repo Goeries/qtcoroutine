@@ -2801,6 +2801,90 @@ void test_hygiene_api() {
     TEST_ASSERT(!pending.isCancelled(), "task state intact despite a throwing callback");
 }
 
+// ====================================================================
+// 85. Cross-thread request_stop on a signal await: the stop callback
+//     runs on the requesting thread; the cancellation must marshal
+//     back to the awaiting thread (README's "inputs are unrestricted")
+// ====================================================================
+
+QtCoroutine::QTask<void> awaitVoidCancellableRecordThread85(Emitter * e, std::stop_token st, QThread ** resumedOn) {
+    try {
+        co_await QtCoroutine::signal(e, &Emitter::voidSignal).cancelledBy(st);
+    } catch (...) {
+        *resumedOn = QThread::currentThread();
+        throw;
+    }
+}
+
+void test_cross_thread_request_stop(QCoreApplication & app) {
+    std::cout << "test_cross_thread_request_stop\n";
+
+    Emitter e; // never emits
+    std::stop_source ss;
+
+    QThread * resumedOn = nullptr;
+    auto task = awaitVoidCancellableRecordThread85(&e, ss.get_token(), &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    // Start the worker only after the await is armed — see test 73. The
+    // stop callback runs synchronously inside request_stop() on the worker.
+    std::unique_ptr<QThread> worker(QThread::create([&ss]() { ss.request_stop(); }));
+    worker->start();
+
+    QTimer::singleShot(200, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "should resume after cross-thread request_stop");
+    if (task.await_ready()) {
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::AwaitCancelled::Stopped, "reason should be Stopped");
+        TEST_ASSERT(resumedOn == QThread::currentThread(), "cancellation unwinds on the awaiting thread");
+    }
+
+    worker->wait();
+}
+
+// ====================================================================
+// 86. Cross-thread request_stop through the cancelledBy(task, token)
+//     combinator — the other stop-callback marshalling path
+// ====================================================================
+
+QtCoroutine::QTask<int> cancelledByCrossThread86(Emitter * e, std::stop_token st, QThread ** resumedOn) {
+    auto task = awaitOneArg(e);
+    try {
+        co_return co_await QtCoroutine::cancelledBy(task, st);
+    } catch (...) {
+        *resumedOn = QThread::currentThread();
+        throw;
+    }
+}
+
+void test_cross_thread_request_stop_cancelledBy(QCoreApplication & app) {
+    std::cout << "test_cross_thread_request_stop_cancelledBy\n";
+
+    Emitter e; // never emits
+    std::stop_source ss;
+
+    QThread * resumedOn = nullptr;
+    auto task = cancelledByCrossThread86(&e, ss.get_token(), &resumedOn);
+    TEST_ASSERT(!task.await_ready(), "should be suspended");
+
+    std::unique_ptr<QThread> worker(QThread::create([&ss]() { ss.request_stop(); }));
+    worker->start(); // after setup — see test 73
+
+    QTimer::singleShot(200, [&]() { app.quit(); });
+    app.exec();
+
+    TEST_ASSERT(task.await_ready(), "should resume after cross-thread request_stop");
+    if (task.await_ready()) {
+        TEST_ASSERT(task.isCancelled(), "should report cancelled");
+        TEST_ASSERT(task.cancelReason() == QtCoroutine::AwaitCancelled::Stopped, "reason should be Stopped");
+        TEST_ASSERT(resumedOn == QThread::currentThread(), "cancellation unwinds on the awaiting thread");
+    }
+
+    worker->wait();
+}
+
 int main(int argc, char * argv[]) {
     QCoreApplication app(argc, argv);
 
@@ -2899,6 +2983,8 @@ int main(int argc, char * argv[]) {
     test_cross_thread_sender_timeout(app);
     test_resumeOn_migrates_to_ctx_thread(app);
     test_then_with_cross_thread_completion(app);
+    test_cross_thread_request_stop(app);
+    test_cross_thread_request_stop_cancelledBy(app);
 
     std::cout << "\n" << g_passed << " passed, " << g_failed << " failed\n";
     return g_failed > 0 ? 1 : 0;
